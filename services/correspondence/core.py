@@ -150,7 +150,7 @@ def check_edge(expected, target, actor, matter_id, reason, *, mock=False):
     if target == State.QUARANTINED:
         if matter_id is not None or reason not in QUARANTINE_REASONS:
             raise Denied('invalid quarantine')
-    elif target in ({State.VALIDATED,State.RUNNING,State.REVIEW_REQUIRED,State.REJECTED,State.FAILED} | RESERVED) and matter_id is None:
+    elif target in ({State.VALIDATED,State.RUNNING,State.REVIEW_REQUIRED,State.REJECTED,State.FAILED,State.CANCELLED} | RESERVED) and matter_id is None:
         raise Denied('verified scope required')
 
 
@@ -162,6 +162,68 @@ class Audit:
     at: datetime
 
 
+@dataclass(frozen=True)
+class Proposal:
+    run_id: UUID
+    matter_id: UUID
+    firm_id: UUID
+    action_type: str
+    destination: str
+    payload: str
+    source_versions: tuple[tuple[str,str], ...]
+    policy_version: str
+    proposal_id: UUID = field(default_factory=uuid4)
+
+    @property
+    def verified_matter_id(self) -> UUID:
+        return self.matter_id
+
+    @property
+    def source_reference_versions(self) -> tuple[tuple[str,str], ...]:
+        return tuple(sorted(self.source_versions))
+
+    @property
+    def action_digest(self):
+        return digest([self.action_type,self.destination,self.payload,str(self.matter_id),
+                       sorted(self.source_versions),self.policy_version])
+
+
+ActionProposal = Proposal
+
+
+@dataclass(frozen=True)
+class Approval:
+    run_id: UUID
+    firm_id: UUID
+    matter_id: UUID
+    reviewer_id: UUID
+    action_digest: str
+    destination: str
+    policy_version: str
+    expires_at: datetime
+    revoked: bool = False
+    approval_id: UUID = field(default_factory=uuid4)
+    proposal_id: UUID | None = None
+
+    @property
+    def verified_matter_id(self) -> UUID:
+        return self.matter_id
+
+
+@dataclass(frozen=True)
+class AcceptedApproval:
+    approval_id: UUID
+    proposal_id: UUID
+    run_id: UUID
+    firm_id: UUID
+    verified_matter_id: UUID
+    reviewer_id: UUID
+    action_digest: str
+    source_reference_versions: tuple[tuple[str,str], ...]
+    proposal: Proposal
+    approval: Approval
+
+
 @dataclass
 class Run:
     firm_id: UUID
@@ -169,6 +231,7 @@ class Run:
     status: State = State.RECEIVED
     matter_id: UUID | None = None
     audit: list[Audit] = field(default_factory=list)
+    accepted_approval: AcceptedApproval | None = None
 
     @property
     def scope_mode(self):
@@ -177,14 +240,23 @@ class Run:
     def move(self, expected, target, actor, now, reason, *, resolved_matter=None):
         self._move(expected,target,actor,now,reason,resolved_matter=resolved_matter)
 
-    def _move(self, expected, target, actor, now, reason, *, resolved_matter=None, mock=False):
+    def _move(self, expected, target, actor, now, reason, *, resolved_matter=None, mock=False, accepted_approval=None):
         if self.status != expected:
             raise Denied('stale status')
         if resolved_matter is not None and (expected,target,actor) != (State.RECEIVED,State.VALIDATED,Actor.RESOLVER):
             raise Denied('scope change denied')
+        if target == State.APPROVED and accepted_approval is None:
+            raise Denied('accepted approval record required')
+        if accepted_approval is not None and (
+            (expected,target,actor,mock) != (State.REVIEW_REQUIRED,State.APPROVED,Actor.ATTORNEY,True)
+            or self.accepted_approval is not None
+        ):
+            raise Denied('approval binding denied')
         matter = resolved_matter if resolved_matter is not None else self.matter_id
         check_edge(expected,target,actor,matter,reason,mock=mock)
         self.matter_id, self.status = matter, target
+        if accepted_approval is not None:
+            self.accepted_approval = accepted_approval
         self.audit.append(Audit(target,actor,reason,now))
 
 
@@ -221,44 +293,20 @@ class Intake:
         run.move(State.RUNNING,State.REVIEW_REQUIRED,Actor.INDEPENDENT_REVIEW,now,'SYNTHETIC_REVIEW')
 
 
-@dataclass(frozen=True)
-class Proposal:
-    run_id: UUID
-    matter_id: UUID
-    firm_id: UUID
-    action_type: str
-    destination: str
-    payload: str
-    source_versions: tuple[tuple[str,str], ...]
-    policy_version: str
-
-    @property
-    def action_digest(self):
-        return digest([self.action_type,self.destination,self.payload,str(self.matter_id),
-                       sorted(self.source_versions),self.policy_version])
-
-
-@dataclass(frozen=True)
-class Approval:
-    run_id: UUID
-    firm_id: UUID
-    matter_id: UUID
-    reviewer_id: UUID
-    action_digest: str
-    destination: str
-    policy_version: str
-    expires_at: datetime
-    revoked: bool = False
-
-
 class MockPolicyExecutor:
     """Local fixture simulation only; there is no external adapter method."""
     def __init__(self):
         self.effects = {}
+        self.accepted_approvals = {}
+        self.revoked_approvals = set()
 
     def _check(self, run, p, a, versions, now, permitted, enabled):
-        if (not permitted or not enabled or a.revoked or not a.reviewer_id.int
-            or a.expires_at.tzinfo is None or now.tzinfo is None or a.expires_at <= now
+        if (permitted is not True or enabled is not True or a.revoked is not False
+            or not p.proposal_id.int or not a.approval_id.int or not a.reviewer_id.int
+            or a.proposal_id not in (None, p.proposal_id)
+            or now is None or a.expires_at.tzinfo is None or a.expires_at.utcoffset() is None
+            or now.tzinfo is None or now.utcoffset() is None or a.expires_at <= now
+            or run.matter_id is None
             or (run.run_id,run.firm_id,run.matter_id) != (p.run_id,p.firm_id,p.matter_id)
             or (run.run_id,run.firm_id,run.matter_id) != (a.run_id,a.firm_id,a.matter_id)
             or not p.source_versions or len({ref for ref,_ in p.source_versions}) != len(p.source_versions)
@@ -270,11 +318,64 @@ class MockPolicyExecutor:
 
     def approve(self, run, p, a, versions, now, *, permitted=False):
         self._check(run,p,a,versions,now,permitted,True)
-        run._move(State.REVIEW_REQUIRED,State.APPROVED,Actor.ATTORNEY,now,'MOCK_APPROVAL',mock=True)
+        canonical_sources = tuple(sorted((ref, ver) for ref, ver in p.source_versions))
+        bound_proposal = Proposal(
+            p.run_id,p.matter_id,p.firm_id,p.action_type,p.destination,
+            p.payload,canonical_sources,p.policy_version,p.proposal_id,
+        )
+        bound_approval = Approval(
+            a.run_id,a.firm_id,a.matter_id,a.reviewer_id,a.action_digest,
+            a.destination,a.policy_version,a.expires_at,False,a.approval_id,p.proposal_id,
+        )
+        accepted = AcceptedApproval(
+            approval_id=a.approval_id,
+            proposal_id=p.proposal_id,
+            run_id=run.run_id,
+            firm_id=run.firm_id,
+            verified_matter_id=run.matter_id,
+            reviewer_id=a.reviewer_id,
+            action_digest=bound_proposal.action_digest,
+            source_reference_versions=canonical_sources,
+            proposal=bound_proposal,
+            approval=bound_approval,
+        )
+        run._move(
+            State.REVIEW_REQUIRED,State.APPROVED,Actor.ATTORNEY,now,'MOCK_APPROVAL',
+            mock=True,accepted_approval=accepted,
+        )
+        self.accepted_approvals[run.run_id] = accepted
 
-    def execute(self, run, p, a, versions, now, *, permitted=False, enabled=False, timeout=False):
-        self._check(run,p,a,versions,now,permitted,enabled)
-        key = (run.firm_id,run.matter_id,p.action_digest)
+    def revoke(self, run_id: UUID, approval_id: UUID):
+        self.revoked_approvals.add((run_id, approval_id))
+
+    def execute(self, run, p=None, a=None, versions=(), now=None, *, approval_id=None, permitted=False, enabled=False, timeout=False):
+        bound = run.accepted_approval
+        if bound is None or self.accepted_approvals.get(run.run_id) != bound:
+            raise Denied('missing or unregistered run approval')
+        if (run.run_id, bound.approval_id) in self.revoked_approvals:
+            raise Denied('invalid synthetic approval')
+        if approval_id is not None and approval_id != bound.approval_id:
+            raise Denied('invalid synthetic approval')
+        if p is None and a is None:
+            if approval_id != bound.approval_id:
+                raise Denied('invalid synthetic approval')
+            p, a = bound.proposal, bound.approval
+        elif p is None or a is None:
+            raise Denied('invalid synthetic approval')
+        else:
+            self._check(run,p,a,versions,now,permitted,enabled)
+            if (p.proposal_id != bound.proposal_id
+                or a.approval_id != bound.approval_id
+                or a.proposal_id not in (None, bound.proposal_id)
+                or p.action_digest != bound.action_digest
+                or a.action_digest != bound.action_digest
+                or (p.run_id,p.firm_id,p.matter_id,p.action_type,p.destination,p.payload,tuple(sorted(p.source_versions)),p.policy_version)
+                   != (bound.run_id,bound.firm_id,bound.verified_matter_id,bound.proposal.action_type,bound.proposal.destination,bound.proposal.payload,bound.source_reference_versions,bound.proposal.policy_version)
+                or (a.run_id,a.firm_id,a.matter_id,a.reviewer_id,a.destination,a.policy_version,a.expires_at)
+                   != (bound.run_id,bound.firm_id,bound.verified_matter_id,bound.reviewer_id,bound.approval.destination,bound.approval.policy_version,bound.approval.expires_at)):
+                raise Denied('unapproved replacement action')
+        self._check(run,bound.proposal,bound.approval,versions,now,permitted,enabled)
+        key = (run.firm_id,bound.verified_matter_id,bound.action_digest)
         if key in self.effects:
             raise Denied('effect already leased')
         run._move(State.APPROVED,State.EXECUTING,Actor.POLICY_EXECUTOR,now,'MOCK_LEASE',mock=True)

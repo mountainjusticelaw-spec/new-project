@@ -75,7 +75,7 @@ def resolve_run(conn, *, firm_id, run_id, trusted_signals):
         with conn.cursor() as cur:
             _scope(cur, firm_id)
             cur.execute("""SELECT firm_id,verified_matter_id,clio_matter_id,eligibility
-                FROM weaverlaw.matter_mapping WHERE firm_id=%s AND clio_matter_id=ANY(%s)""",
+                FROM weaverlaw.matter_mapping WHERE firm_id=%s AND clio_matter_id::text=ANY(%s::text[])""",
                 (firm_id,signals))
             matter, reason = Resolver(Mapping(*row) for row in cur.fetchall()).resolve(firm_id,signals)
             target = State.VALIDATED if matter else State.QUARANTINED

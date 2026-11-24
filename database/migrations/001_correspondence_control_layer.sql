@@ -44,7 +44,7 @@ CREATE TABLE workflow_run (
  status run_status NOT NULL DEFAULT 'RECEIVED', reason_code opaque_id NOT NULL DEFAULT 'ACCEPTED',
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  CHECK(scope_valid(scope_mode,verified_matter_id)),
- CHECK(status NOT IN ('VALIDATED','RUNNING','REVIEW_REQUIRED','APPROVED','EXECUTING','COMPLETED','REJECTED','FAILED','NEEDS_RECONCILIATION') OR (scope_mode='MATTER_VERIFIED' AND verified_matter_id IS NOT NULL)),
+ CHECK(status NOT IN ('VALIDATED','RUNNING','REVIEW_REQUIRED','APPROVED','EXECUTING','COMPLETED','REJECTED','FAILED','CANCELLED','NEEDS_RECONCILIATION') OR (scope_mode='MATTER_VERIFIED' AND verified_matter_id IS NOT NULL)),
  CHECK(status NOT IN ('RECEIVED','QUARANTINED') OR scope_mode='INTAKE_RESTRICTED'),
  CHECK(status <> 'QUARANTINED' OR reason_code IN ('UNMAPPED_MATTER_SIGNAL','CONFLICTING_MATTER_SIGNALS','MATTER_INELIGIBLE')),
  UNIQUE(run_id,verified_matter_id), UNIQUE(run_id,firm_id), UNIQUE(run_id,firm_id,verified_matter_id),
@@ -151,8 +151,8 @@ CREATE POLICY run_insert ON workflow_run FOR INSERT TO wl_intake WITH CHECK(firm
 CREATE POLICY outbox_insert ON outbox FOR INSERT TO wl_intake WITH CHECK(firm_id=context_firm() AND scope_mode='INTAKE_RESTRICTED');
 CREATE POLICY resolve_update ON workflow_run FOR UPDATE TO wl_resolver USING(firm_id=context_firm() AND scope_mode='INTAKE_RESTRICTED') WITH CHECK(firm_id=context_firm() AND (scope_mode='INTAKE_RESTRICTED' OR (scope_mode='MATTER_VERIFIED' AND verified_matter_id=context_matter())));
 CREATE POLICY worker_update ON workflow_run FOR UPDATE TO wl_worker,wl_reviewer,wl_attorney USING(firm_id=context_firm() AND scope_mode='MATTER_VERIFIED' AND verified_matter_id=context_matter()) WITH CHECK(firm_id=context_firm() AND scope_mode='MATTER_VERIFIED' AND verified_matter_id=context_matter());
-CREATE POLICY audit_insert_intake ON audit_event FOR INSERT TO wl_intake,wl_resolver WITH CHECK(firm_id=context_firm() AND scope_mode='INTAKE_RESTRICTED');
-CREATE POLICY audit_insert_matter ON audit_event FOR INSERT TO wl_resolver,wl_worker,wl_reviewer,wl_attorney WITH CHECK(firm_id=context_firm() AND scope_mode='MATTER_VERIFIED' AND verified_matter_id=context_matter());
+CREATE POLICY audit_insert_intake ON audit_event FOR INSERT TO wl_intake,wl_resolver WITH CHECK(firm_id=context_firm() AND scope_mode='INTAKE_RESTRICTED' AND pg_trigger_depth()>0);
+CREATE POLICY audit_insert_matter ON audit_event FOR INSERT TO wl_resolver,wl_worker,wl_reviewer,wl_attorney WITH CHECK(firm_id=context_firm() AND scope_mode='MATTER_VERIFIED' AND verified_matter_id=context_matter() AND pg_trigger_depth()>0);
 -- PR1 deliberately grants no Tier B writes, approval grants, or executor mutations.
 GRANT SELECT,INSERT ON event_inbox,workflow_run,outbox TO wl_intake;
 GRANT SELECT ON matter_mapping,event_inbox,workflow_run,outbox,audit_event TO wl_resolver;

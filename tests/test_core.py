@@ -158,3 +158,74 @@ def test_generic_move_cannot_even_use_claimed_attorney_role():
     with pytest.raises(Denied):
         run.move(State.REVIEW_REQUIRED,State.APPROVED,Actor.ATTORNEY,NOW,'SPOOFED')
     assert run.status == State.REVIEW_REQUIRED
+
+
+def test_execute_rejects_replaced_proposal_and_approval_pair():
+    from services.correspondence.core import Approval, MockPolicyExecutor, Proposal, Run
+    run, p, a, exe = approved_fixture()
+    assert run.accepted_approval is not None
+    assert run.accepted_approval.approval_id == a.approval_id
+    assert run.accepted_approval.proposal_id == p.proposal_id
+    assert run.accepted_approval.action_digest == p.action_digest
+    assert run.accepted_approval.verified_matter_id == MATTER
+    assert run.accepted_approval.source_reference_versions == p.source_versions
+    before = tuple(run.audit)
+
+    # 1. Replaced payload + matching forged approval with fresh IDs must fail.
+    forged_p = Proposal(
+        run.run_id, MATTER, FIRM, 'mock.review', 'synthetic-sink',
+        'unapproved-settlement-email', p.source_versions, 'p1',
+    )
+    forged_a = Approval(
+        run.run_id, FIRM, MATTER, UUID(int=10), forged_p.action_digest,
+        forged_p.destination, forged_p.policy_version, NOW + timedelta(minutes=5),
+    )
+    with pytest.raises(Denied):
+        exe.execute(run, forged_p, forged_a, forged_p.source_versions, NOW, permitted=True, enabled=True)
+
+    # 2. Replaced payload + matching forged digest reusing original proposal_id & approval_id must also fail.
+    spoofed_id_p = Proposal(
+        run.run_id, MATTER, FIRM, 'mock.review', 'synthetic-sink',
+        'unapproved-settlement-email', p.source_versions, 'p1', proposal_id=p.proposal_id,
+    )
+    spoofed_id_a = Approval(
+        run.run_id, FIRM, MATTER, UUID(int=10), spoofed_id_p.action_digest,
+        spoofed_id_p.destination, spoofed_id_p.policy_version, NOW + timedelta(minutes=5),
+        approval_id=a.approval_id, proposal_id=p.proposal_id,
+    )
+    with pytest.raises(Denied):
+        exe.execute(run, spoofed_id_p, spoofed_id_a, spoofed_id_p.source_versions, NOW, permitted=True, enabled=True)
+
+    # 3. Executing against an unapproved run or separate executor instance must fail.
+    other_exe = MockPolicyExecutor()
+    with pytest.raises(Denied):
+        other_exe.execute(run, p, a, p.source_versions, NOW, permitted=True, enabled=True)
+    unapproved_run = Run(firm_id=FIRM, run_id=run.run_id, status=State.APPROVED, matter_id=MATTER)
+    with pytest.raises(Denied):
+        exe.execute(unapproved_run, p, a, p.source_versions, NOW, permitted=True, enabled=True)
+
+    # 4. Executing by mismatched approval_id fails; stored approval remains intact and unexecuted.
+    with pytest.raises(Denied):
+        exe.execute(run, versions=p.source_versions, now=NOW, approval_id=UUID(int=999), permitted=True, enabled=True)
+    assert run.status == State.APPROVED
+    assert not exe.effects
+    assert tuple(run.audit) == before
+
+
+def test_execute_by_bound_approval_id_and_revocation():
+    run, p, a, exe = approved_fixture()
+    exe.revoke(run.run_id, a.approval_id)
+    before = tuple(run.audit)
+    with pytest.raises(Denied):
+        exe.execute(run, p, a, p.source_versions, NOW, permitted=True, enabled=True)
+    assert run.status == State.APPROVED and not exe.effects and tuple(run.audit) == before
+
+    run2, p2, a2, exe2 = approved_fixture()
+    exe2.execute(run2, versions=p2.source_versions, now=NOW, approval_id=a2.approval_id, permitted=True, enabled=True)
+    assert run2.status == State.COMPLETED and len(exe2.effects) == 1
+
+
+def test_cancelled_requires_verified_matter_scope():
+    from services.correspondence.core import check_edge
+    with pytest.raises(Denied):
+        check_edge(State.VALIDATED, State.CANCELLED, Actor.COORDINATOR, None, 'CANCEL')
