@@ -1478,3 +1478,164 @@ def test_replay_storm_bounds_anomaly_audits_and_counts_all_conflicts(seeded_clus
         assert admin.execute(
             'SELECT count(*) FROM weaverlaw.outbox WHERE run_id = %s', (run_id,),
         ).fetchone()[0] == 1
+
+
+def test_security_definer_helpers_do_not_disclose_other_matter_eligibility_or_bindings(seeded_cluster):
+    import psycopg.errors
+
+    other_firm, other_matter = uuid4(), uuid4()
+    other_signal = f'clio-oracle-other-firm-{other_matter.hex}'
+    runs = {}
+    with (
+        _connect(seeded_cluster) as admin,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+    ):
+        admin.execute(
+            """INSERT INTO weaverlaw.matter_mapping
+               (firm_id, verified_matter_id, clio_matter_id, eligibility, mapping_version)
+               VALUES (%s, %s, %s, 'OPEN', 'v1')""", (other_firm, other_matter, other_signal),
+        )
+        for name, firm, matter, signal in (
+            ('a', FIRM_A, MATTER_A, 'clio-live-a'),
+            ('b', FIRM_A, MATTER_B, 'clio-live-b'),
+            ('other-firm', other_firm, other_matter, other_signal),
+        ):
+            run_id, created = receive(
+                intake_conn,
+                _make_envelope(source_ref=f'synthetic-helper-oracle-{name}', firm_id=firm),
+                trusted_firm_id=firm, trusted_signals=[signal],
+            )
+            assert created is True
+            assert resolve_run(resolver_conn, firm_id=firm, run_id=run_id) == (
+                State.VALIDATED, matter, 'MATTER_VERIFIED',
+            )
+            inbox_id = admin.execute(
+                'SELECT inbox_id FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+            ).fetchone()[0]
+            runs[name] = (firm, matter, run_id, inbox_id)
+
+    def helper_calls(target):
+        firm, matter, run_id, inbox_id = target
+        return (
+            ('SELECT weaverlaw.mapping_is_open(%s,%s)', (firm, matter)),
+            ('SELECT weaverlaw.scope_is_active(%s,%s,%s)', (run_id, firm, matter)),
+            ('SELECT weaverlaw.lock_mapping_is_open(%s,%s,%s)', (firm, matter, run_id)),
+            ('SELECT weaverlaw.origin_binds(%s,%s,%s,%s)', (firm, inbox_id, run_id, matter)),
+            ('SELECT weaverlaw.derive_resolution_evidence(%s,%s,%s)', (firm, inbox_id, run_id)),
+            ('SELECT weaverlaw.lock_resolution_inputs(%s,%s,%s)', (firm, inbox_id, matter)),
+            ('SELECT weaverlaw.revalidate_run(%s,%s,%s)', (firm, run_id, matter)),
+        )
+
+    def set_context(conn, firm, matter):
+        conn.execute(
+            "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+            "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+            (str(firm) if firm else '', str(matter) if matter else ''),
+        )
+
+    for role in ('wl_worker', 'wl_reviewer', 'wl_attorney', 'wl_executor'):
+        with _connect(seeded_cluster, role) as conn:
+            # Confirm guards authorize the genuine context rather than denying every call.
+            with conn.transaction():
+                set_context(conn, FIRM_A, MATTER_A)
+                for sql, args in helper_calls(runs['a']):
+                    if 'derive_resolution_evidence' in sql or 'lock_resolution_inputs' in sql:
+                        continue
+                    if role == 'wl_executor' and 'lock_mapping_is_open' in sql:
+                        continue
+                    assert conn.execute(sql, args).fetchone()[0] is True, (role, sql)
+                # An authorized matter cannot lend its run ID to another inbox or vice versa.
+                for inbox_id, run_id in (
+                    (runs['b'][3], runs['a'][2]),
+                    (runs['a'][3], runs['b'][2]),
+                ):
+                    assert conn.execute(
+                        'SELECT weaverlaw.origin_binds(%s,%s,%s,%s)',
+                        (FIRM_A, inbox_id, run_id, MATTER_A),
+                    ).fetchone()[0] is False
+            for sql, args in helper_calls(runs['a']):
+                if 'derive_resolution_evidence' not in sql and 'lock_resolution_inputs' not in sql:
+                    continue
+                with pytest.raises(psycopg.errors.InsufficientPrivilege), conn.transaction():
+                    set_context(conn, FIRM_A, MATTER_A)
+                    conn.execute(sql, args).fetchone()
+            for context in ((FIRM_A, MATTER_A), (FIRM_A, None), (None, None)):
+                for target in (runs['b'], runs['other-firm']):
+                    for sql, args in helper_calls(target):
+                        try:
+                            with conn.transaction():
+                                set_context(conn, *context)
+                                result = conn.execute(sql, args).fetchone()[0]
+                                assert result is False or result is None, (role, context, sql, result)
+                        except psycopg.errors.InsufficientPrivilege as err:
+                            assert err.sqlstate == '42501'
+
+    with _connect(seeded_cluster, 'wl_intake') as intake_conn:
+        for context in ((FIRM_A, None), (FIRM_A, MATTER_A)):
+            for target in (runs['b'], runs['other-firm']):
+                for sql, args in helper_calls(target):
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege), intake_conn.transaction():
+                        set_context(intake_conn, *context)
+                        intake_conn.execute(sql, args).fetchone()
+    with (
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+        pytest.raises(psycopg.errors.InsufficientPrivilege),
+        resolver_conn.transaction(),
+    ):
+        set_context(resolver_conn, FIRM_A, MATTER_A)
+        resolver_conn.execute(
+            'SELECT weaverlaw.revalidate_run(%s,%s,%s)',
+            (FIRM_A, runs['a'][2], MATTER_A),
+        ).fetchone()
+
+    # Rejected calls neither re-scope the target runs nor append audit or replay records.
+    with _connect(seeded_cluster) as admin:
+        for firm, matter, run_id, _inbox_id in runs.values():
+            assert admin.execute(
+                'SELECT firm_id, status, verified_matter_id, replay_conflict_count '
+                'FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+            ).fetchone() == (firm, 'VALIDATED', matter, 0)
+            assert admin.execute(
+                'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+            ).fetchone()[0] == 2
+
+
+def test_weaverlaw_function_execute_privileges_are_explicit_and_role_scoped(seeded_cluster):
+    with _connect(seeded_cluster) as admin:
+        public_executes = admin.execute(
+            """SELECT p.oid::pg_catalog.regprocedure::pg_catalog.text
+               FROM pg_catalog.pg_proc p
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+               CROSS JOIN LATERAL pg_catalog.aclexplode(
+                   COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))
+               ) acl
+               WHERE n.nspname = 'weaverlaw' AND acl.grantee = 0
+                 AND acl.privilege_type = 'EXECUTE'
+               ORDER BY 1"""
+        ).fetchall()
+        assert public_executes == [], f'PUBLIC may execute WeaverLaw functions: {public_executes}'
+        for role in ROLES:
+            can_replay, can_revalidate = admin.execute(
+                "SELECT pg_catalog.has_function_privilege(%s, %s, 'EXECUTE'), "
+                "pg_catalog.has_function_privilege(%s, %s, 'EXECUTE')",
+                (
+                    role, 'weaverlaw.check_replay(uuid,uuid,jsonb,text,text,text)',
+                    role, 'weaverlaw.revalidate_run(uuid,uuid,uuid)',
+                ),
+            ).fetchone()
+            assert can_replay is (role == 'wl_intake'), role
+            assert can_revalidate is (role in ('wl_worker', 'wl_reviewer', 'wl_attorney', 'wl_executor')), role
+        triggers = admin.execute(
+            """SELECT p.oid::pg_catalog.regprocedure::pg_catalog.text
+               FROM pg_catalog.pg_proc p
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'weaverlaw' AND p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype
+               ORDER BY 1"""
+        ).fetchall()
+        assert triggers
+        for role in ROLES:
+            for (function,) in triggers:
+                assert admin.execute(
+                    "SELECT pg_catalog.has_function_privilege(%s, %s, 'EXECUTE')", (role, function),
+                ).fetchone()[0] is False, (role, function)

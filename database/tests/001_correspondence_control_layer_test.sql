@@ -8,6 +8,16 @@ DO $$ BEGIN
  IF (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='weaverlaw' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity) <> 12 THEN
   RAISE EXCEPTION 'all twelve tables must force RLS';
  END IF;
+ IF EXISTS(SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+  CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+  WHERE n.nspname='weaverlaw' AND a.grantee=0 AND a.privilege_type='EXECUTE') THEN
+  RAISE EXCEPTION 'PUBLIC retains function execution';
+ END IF;
+ IF pg_catalog.has_function_privilege('wl_intake','weaverlaw.revalidate_run(uuid,uuid,uuid)','EXECUTE')
+  OR pg_catalog.has_function_privilege('wl_resolver','weaverlaw.revalidate_run(uuid,uuid,uuid)','EXECUTE')
+  OR NOT pg_catalog.has_function_privilege('wl_executor','weaverlaw.revalidate_run(uuid,uuid,uuid)','EXECUTE') THEN
+  RAISE EXCEPTION 'revalidation function role matrix differs';
+ END IF;
 END $$;
 -- Bound adapter signal validation is identical to the Python contract.
 DO $$ BEGIN
@@ -65,6 +75,27 @@ SELECT set_config('app.verified_matter_id','00000000-0000-0000-0000-000000000002
 DO $$ DECLARE n integer; BEGIN
  IF (SELECT count(*) FROM weaverlaw.workflow_step) <> 1 OR (SELECT count(*) FROM weaverlaw.workflow_run) <> 1 THEN RAISE EXCEPTION 'cross-matter leak'; END IF;
  IF (SELECT count(*) FROM weaverlaw.audit_event) <> 1 THEN RAISE EXCEPTION 'missing verified resolution audit'; END IF;
+ IF weaverlaw.mapping_is_open('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000003')
+  OR weaverlaw.scope_is_active('00000000-0000-0000-0000-000000000032','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000003')
+  OR weaverlaw.origin_binds('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000032','00000000-0000-0000-0000-000000000002')
+  OR weaverlaw.lock_mapping_is_open('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000032') THEN
+  RAISE EXCEPTION 'direct helper accepted cross-matter or spliced identifiers';
+ END IF;
+ BEGIN
+  PERFORM weaverlaw.derive_resolution_evidence('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000032');
+  RAISE EXCEPTION 'worker gained raw evidence derivation';
+ EXCEPTION WHEN insufficient_privilege THEN NULL;
+ END;
+ BEGIN
+  PERFORM weaverlaw.lock_resolution_inputs('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000003');
+  RAISE EXCEPTION 'worker gained raw input locking';
+ EXCEPTION WHEN insufficient_privilege THEN NULL;
+ END;
+ BEGIN
+  PERFORM weaverlaw.revalidate_run('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000032','00000000-0000-0000-0000-000000000003');
+  RAISE EXCEPTION 'cross-matter revalidation accepted';
+ EXCEPTION WHEN insufficient_privilege THEN NULL;
+ END;
  BEGIN
   UPDATE weaverlaw.workflow_run SET status='EXECUTING',reason_code='UNAUTHORIZED' WHERE status='VALIDATED';
   RAISE EXCEPTION 'illegal transition accepted';

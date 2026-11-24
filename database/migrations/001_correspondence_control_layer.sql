@@ -25,12 +25,20 @@ CREATE DOMAIN weaverlaw.opaque_id AS text CHECK (VALUE ~ '^[A-Za-z0-9][A-Za-z0-9
 CREATE FUNCTION weaverlaw.context_firm() RETURNS uuid LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
  SELECT NULLIF(pg_catalog.current_setting('app.verified_firm_id',true),'')::pg_catalog.uuid
 $$;
+REVOKE ALL ON FUNCTION weaverlaw.context_firm() FROM PUBLIC;
 CREATE FUNCTION weaverlaw.context_matter() RETURNS uuid LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
  SELECT NULLIF(pg_catalog.current_setting('app.verified_matter_id',true),'')::pg_catalog.uuid
 $$;
+REVOKE ALL ON FUNCTION weaverlaw.context_matter() FROM PUBLIC;
+-- SECURITY DEFINER changes current_user; authority follows the authenticated outer role.
+CREATE FUNCTION weaverlaw.caller_role() RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
+ SELECT COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user)::pg_catalog.text
+$$;
+REVOKE ALL ON FUNCTION weaverlaw.caller_role() FROM PUBLIC;
 CREATE FUNCTION weaverlaw.scope_valid(mode weaverlaw.scope_mode, matter uuid) RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$
  SELECT (mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode AND matter IS NULL) OR (mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND matter IS NOT NULL)
 $$;
+REVOKE ALL ON FUNCTION weaverlaw.scope_valid(weaverlaw.scope_mode,uuid) FROM PUBLIC;
 CREATE TABLE weaverlaw.matter_mapping (
  firm_id uuid NOT NULL, verified_matter_id uuid NOT NULL, clio_matter_id weaverlaw.opaque_id NOT NULL,
  eligibility text NOT NULL CHECK (eligibility IN ('OPEN','CLOSED','RESTRICTED')),
@@ -61,6 +69,7 @@ BEGIN
  IF pg_catalog.jsonb_array_length(result)>32 THEN RAISE EXCEPTION 'too many unique signals' USING ERRCODE='23514'; END IF;
  RETURN result;
 END $$;
+REVOKE ALL ON FUNCTION weaverlaw.canonical_signals(jsonb) FROM PUBLIC;
 CREATE TABLE weaverlaw.event_inbox (
  inbox_id uuid PRIMARY KEY, firm_id uuid NOT NULL, event_id uuid NOT NULL, source text NOT NULL CHECK(source='synthetic.gmail'),
  event_type text NOT NULL CHECK(event_type='correspondence.received'), schema_version integer NOT NULL CHECK(schema_version=1),
@@ -181,10 +190,25 @@ CREATE INDEX outbox_firm_created_idx ON weaverlaw.outbox(firm_id,created_at);
 CREATE FUNCTION weaverlaw.derive_resolution_evidence(p_firm uuid,p_inbox uuid,p_run uuid)
  RETURNS jsonb LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
- v_inbox weaverlaw.event_inbox%ROWTYPE; v_matches jsonb; v_versions jsonb;
+ v_inbox weaverlaw.event_inbox%ROWTYPE; v_run weaverlaw.workflow_run%ROWTYPE;
+ v_actor text := weaverlaw.caller_role(); v_matches jsonb; v_versions jsonb;
  v_count integer; v_matter uuid; v_reason text; v_target weaverlaw.run_status;
 BEGIN
- IF p_firm IS DISTINCT FROM weaverlaw.context_firm() THEN RETURN NULL; END IF;
+ IF p_firm IS NULL OR p_firm IS DISTINCT FROM weaverlaw.context_firm() THEN RETURN NULL; END IF;
+ SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.inbox_id=p_inbox AND r.firm_id=p_firm;
+ IF NOT FOUND THEN RETURN NULL; END IF;
+ IF v_actor='wl_resolver' AND v_run.status='RECEIVED'::weaverlaw.run_status
+  AND v_run.scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode THEN
+  NULL; -- Resolver may inspect bound unresolved intake within its firm.
+ ELSIF v_actor='wl_intake' THEN
+  -- Intake has no EXECUTE grant on this helper: only check_replay reaches this path.
+  NULL;
+ ELSIF v_actor IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor')
+  AND weaverlaw.context_matter() IS NOT NULL AND v_run.resolved_matter_id=weaverlaw.context_matter()
+  AND v_run.verified_matter_id=weaverlaw.context_matter() AND v_run.scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode THEN
+  NULL;
+ ELSE RETURN NULL;
+ END IF;
  SELECT * INTO v_inbox FROM weaverlaw.event_inbox i WHERE i.inbox_id=p_inbox AND i.firm_id=p_firm;
  IF NOT FOUND THEN RETURN NULL; END IF;
  SELECT COALESCE(pg_catalog.jsonb_agg(m.clio_matter_id::pg_catalog.text ORDER BY m.clio_matter_id::pg_catalog.text COLLATE "C"),'[]'::pg_catalog.jsonb),
@@ -213,9 +237,23 @@ GRANT EXECUTE ON FUNCTION weaverlaw.derive_resolution_evidence(uuid,uuid,uuid) T
 -- Lock all original signal matches and the historical anchor in UUID order before run locks.
 CREATE FUNCTION weaverlaw.lock_resolution_inputs(p_firm uuid,p_inbox uuid,p_expected uuid)
  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE v_signals jsonb;
+DECLARE v_signals jsonb; v_run weaverlaw.workflow_run%ROWTYPE; v_actor text := weaverlaw.caller_role();
 BEGIN
- IF p_firm IS DISTINCT FROM weaverlaw.context_firm() THEN RETURN false; END IF;
+ IF p_firm IS NULL OR p_firm IS DISTINCT FROM weaverlaw.context_firm() THEN RETURN false; END IF;
+ SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.inbox_id=p_inbox AND r.firm_id=p_firm;
+ IF NOT FOUND OR p_expected IS DISTINCT FROM v_run.resolved_matter_id THEN RETURN false; END IF;
+ IF v_actor='wl_resolver' AND v_run.status='RECEIVED'::weaverlaw.run_status
+  AND v_run.scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode THEN
+  NULL;
+ ELSIF v_actor='wl_intake' THEN
+  -- No direct intake EXECUTE grant; check_replay already bound this inbox to its run.
+  NULL;
+ ELSIF v_actor IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor')
+  AND p_expected IS NOT NULL AND p_expected=weaverlaw.context_matter()
+  AND v_run.verified_matter_id=p_expected AND v_run.scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode THEN
+  NULL;
+ ELSE RETURN false;
+ END IF;
  SELECT i.matter_signals INTO v_signals FROM weaverlaw.event_inbox i WHERE i.inbox_id=p_inbox AND i.firm_id=p_firm;
  IF NOT FOUND THEN RETURN false; END IF;
  PERFORM m.verified_matter_id FROM weaverlaw.matter_mapping m
@@ -230,9 +268,11 @@ GRANT EXECUTE ON FUNCTION weaverlaw.lock_resolution_inputs(uuid,uuid,uuid) TO wl
 
 CREATE FUNCTION weaverlaw.mapping_is_open(p_firm uuid,p_matter uuid) RETURNS boolean
  LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
- SELECT p_firm=weaverlaw.context_firm() AND EXISTS(
-  SELECT 1 FROM weaverlaw.matter_mapping m WHERE m.firm_id=p_firm AND m.verified_matter_id=p_matter AND m.eligibility='OPEN'
- )
+ SELECT COALESCE(weaverlaw.caller_role() IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor')
+  AND p_firm IS NOT NULL AND p_firm=weaverlaw.context_firm()
+  AND p_matter IS NOT NULL AND p_matter=weaverlaw.context_matter() AND EXISTS(
+   SELECT 1 FROM weaverlaw.matter_mapping m WHERE m.firm_id=p_firm AND m.verified_matter_id=p_matter AND m.eligibility='OPEN'
+  ),false)
 $$;
 ALTER FUNCTION weaverlaw.mapping_is_open(uuid,uuid) OWNER TO wl_scope_guard;
 REVOKE ALL ON FUNCTION weaverlaw.mapping_is_open(uuid,uuid) FROM PUBLIC;
@@ -241,9 +281,16 @@ GRANT EXECUTE ON FUNCTION weaverlaw.mapping_is_open(uuid,uuid) TO wl_resolver,wl
 -- Evaluated from the candidate row fields, including UPDATE RETURNING during initial promotion.
 CREATE FUNCTION weaverlaw.origin_binds(p_firm uuid,p_inbox uuid,p_run uuid,p_matter uuid)
  RETURNS boolean LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
-DECLARE v_evidence jsonb;
+DECLARE v_evidence jsonb; v_run weaverlaw.workflow_run%ROWTYPE; v_actor text := weaverlaw.caller_role();
 BEGIN
- IF p_firm IS DISTINCT FROM weaverlaw.context_firm() OR p_matter IS NULL THEN RETURN false; END IF;
+ IF v_actor NOT IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor')
+  OR p_firm IS NULL OR p_firm IS DISTINCT FROM weaverlaw.context_firm()
+  OR p_matter IS NULL OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN RETURN false; END IF;
+ SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.inbox_id=p_inbox AND r.firm_id=p_firm;
+ IF NOT FOUND THEN RETURN false; END IF;
+ IF NOT (v_actor='wl_resolver' AND v_run.status='RECEIVED'::weaverlaw.run_status AND v_run.scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode)
+  AND (v_run.scope_mode<>'MATTER_VERIFIED'::weaverlaw.scope_mode OR v_run.verified_matter_id IS DISTINCT FROM p_matter
+   OR v_run.resolved_matter_id IS DISTINCT FROM p_matter) THEN RETURN false; END IF;
  v_evidence:=weaverlaw.derive_resolution_evidence(p_firm,p_inbox,p_run);
  RETURN COALESCE(v_evidence->>'decision'='VALIDATED' AND (v_evidence->>'verified_matter_id')::pg_catalog.uuid=p_matter
   AND weaverlaw.mapping_is_open(p_firm,p_matter),false);
@@ -256,7 +303,9 @@ CREATE FUNCTION weaverlaw.scope_is_active(p_run uuid,p_firm uuid,p_matter uuid) 
  LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_run weaverlaw.workflow_run%ROWTYPE; v_evidence jsonb;
 BEGIN
- IF p_firm IS DISTINCT FROM weaverlaw.context_firm() OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN RETURN false; END IF;
+ IF weaverlaw.caller_role() NOT IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor')
+  OR p_firm IS NULL OR p_firm IS DISTINCT FROM weaverlaw.context_firm()
+  OR p_matter IS NULL OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN RETURN false; END IF;
  SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.firm_id=p_firm;
  IF NOT FOUND OR v_run.scope_mode<>'MATTER_VERIFIED'::weaverlaw.scope_mode
   OR v_run.verified_matter_id IS DISTINCT FROM p_matter OR v_run.resolved_matter_id IS DISTINCT FROM p_matter THEN RETURN false; END IF;
@@ -273,7 +322,9 @@ CREATE FUNCTION weaverlaw.lock_mapping_is_open(p_firm uuid,p_matter uuid,p_run u
  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE v_run weaverlaw.workflow_run%ROWTYPE; v_evidence jsonb;
 BEGIN
- IF p_firm IS DISTINCT FROM weaverlaw.context_firm() OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN RETURN false; END IF;
+ IF weaverlaw.caller_role() NOT IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor')
+  OR p_firm IS NULL OR p_firm IS DISTINCT FROM weaverlaw.context_firm()
+  OR p_matter IS NULL OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN RETURN false; END IF;
  SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.firm_id=p_firm;
  IF NOT FOUND OR v_run.resolved_matter_id IS DISTINCT FROM p_matter THEN RETURN false; END IF;
  IF NOT weaverlaw.lock_resolution_inputs(p_firm,v_run.inbox_id,p_matter) THEN RETURN false; END IF;
@@ -283,7 +334,7 @@ BEGIN
 END $$;
 ALTER FUNCTION weaverlaw.lock_mapping_is_open(uuid,uuid,uuid) OWNER TO wl_scope_guard;
 REVOKE ALL ON FUNCTION weaverlaw.lock_mapping_is_open(uuid,uuid,uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION weaverlaw.lock_mapping_is_open(uuid,uuid,uuid) TO wl_resolver,wl_worker,wl_reviewer,wl_attorney;
+GRANT EXECUTE ON FUNCTION weaverlaw.lock_mapping_is_open(uuid,uuid,uuid) TO wl_worker,wl_reviewer,wl_attorney;
 -- All tables force RLS. No public policies; absent scope is deny-by-default.
 DO $$ DECLARE t text; BEGIN
  FOREACH t IN ARRAY ARRAY['matter_mapping','event_inbox','workflow_run','outbox','audit_event','workflow_step','agent_run','source_reference','work_product','action_proposal','approval','effect_journal'] LOOP
@@ -339,9 +390,11 @@ BEGIN
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;
 END $$;
+REVOKE ALL ON FUNCTION weaverlaw.deny_app_mapping_mutation() FROM PUBLIC;
 CREATE TRIGGER mapping_immutable_for_app BEFORE INSERT OR UPDATE OR DELETE ON weaverlaw.matter_mapping FOR EACH ROW EXECUTE FUNCTION weaverlaw.deny_app_mapping_mutation();
 CREATE FUNCTION weaverlaw.deny_inbox_mutation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN RAISE EXCEPTION 'immutable intake evidence' USING ERRCODE='23514'; END $$;
+REVOKE ALL ON FUNCTION weaverlaw.deny_inbox_mutation() FROM PUBLIC;
 CREATE TRIGGER inbox_immutable BEFORE UPDATE OR DELETE ON weaverlaw.event_inbox FOR EACH ROW EXECUTE FUNCTION weaverlaw.deny_inbox_mutation();
 -- Defense-in-depth: even a direct UPDATE by a permitted service role must obey edges.
 CREATE FUNCTION weaverlaw.enforce_run_edge() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
@@ -408,6 +461,7 @@ BEGIN
  END IF;
  RAISE EXCEPTION 'illegal or disabled transition' USING ERRCODE='23514';
 END $$;
+REVOKE ALL ON FUNCTION weaverlaw.enforce_run_edge() FROM PUBLIC;
 CREATE TRIGGER run_edge BEFORE UPDATE ON weaverlaw.workflow_run FOR EACH ROW EXECUTE FUNCTION weaverlaw.enforce_run_edge();
 -- Audit write is isolated to SECURITY DEFINER wl_audit_writer in the same transaction; failure aborts the state mutation.
 CREATE FUNCTION weaverlaw.audit_run_edge() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
@@ -496,8 +550,7 @@ BEGIN
   PERFORM pg_catalog.set_config('app.verified_matter_id',COALESCE(v_prior_matter,''),true);
  ELSIF v_run.status IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status,'EXECUTING'::weaverlaw.run_status) THEN
   v_evidence:=weaverlaw.derive_resolution_evidence(p_firm,p_inbox,v_run.run_id);
-  IF v_evidence->>'decision'<>'VALIDATED' OR (v_evidence->>'verified_matter_id')::pg_catalog.uuid IS DISTINCT FROM v_run.resolved_matter_id
-   OR NOT weaverlaw.mapping_is_open(p_firm,v_run.resolved_matter_id) THEN
+  IF v_evidence->>'decision'<>'VALIDATED' OR (v_evidence->>'verified_matter_id')::pg_catalog.uuid IS DISTINCT FROM v_run.resolved_matter_id THEN
    UPDATE weaverlaw.workflow_run SET status='QUARANTINED'::weaverlaw.run_status,reason_code='MATTER_INELIGIBLE',
     scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode,verified_matter_id=NULL WHERE run_id=v_run.run_id AND firm_id=p_firm;
   END IF;
@@ -515,7 +568,7 @@ DECLARE
  v_actor text := COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user);
  v_run weaverlaw.workflow_run%ROWTYPE; v_open boolean := false;
 BEGIN
- IF v_actor NOT IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney')
+ IF v_actor NOT IN ('wl_worker','wl_reviewer','wl_attorney','wl_executor')
   OR p_firm IS DISTINCT FROM weaverlaw.context_firm() OR p_matter IS NULL
   OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN
   RAISE EXCEPTION 'unauthorized revalidation' USING ERRCODE='42501';
@@ -537,5 +590,13 @@ BEGIN
 END $$;
 ALTER FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) OWNER TO wl_scope_guard;
 REVOKE ALL ON FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) TO wl_resolver,wl_worker,wl_reviewer,wl_attorney;
+GRANT EXECUTE ON FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) TO wl_worker,wl_reviewer,wl_attorney,wl_executor;
+-- Revoke default PostgreSQL function execution, including ordinary validation helpers.
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA weaverlaw FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION weaverlaw.context_firm(),weaverlaw.context_matter()
+ TO wl_intake,wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_executor,wl_audit_writer,wl_scope_guard;
+GRANT EXECUTE ON FUNCTION weaverlaw.caller_role() TO wl_scope_guard;
+GRANT EXECUTE ON FUNCTION weaverlaw.scope_valid(weaverlaw.scope_mode,uuid)
+ TO wl_intake,wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_audit_writer,wl_scope_guard;
+GRANT EXECUTE ON FUNCTION weaverlaw.canonical_signals(jsonb) TO wl_intake,wl_scope_guard;
 COMMIT;
