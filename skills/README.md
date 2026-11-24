@@ -1,2 +1,20 @@
-# Reusable skills (planned)
-Version-controlled, approved non-client-specific legal and operational procedures, templates and output requirements. Review rights and confidentiality before importing existing material. Treat skill instructions as subordinate to policy and attorney authority. No imported skills or executable definitions yet.
+# Repository skills
+
+These ten WeaverLawOS workspace skills define the staged engineering, Georgia legal-supervision, security, provenance, orchestration, and verification controls across the roadmap:
+
+| Skill | Use |
+| --- | --- |
+| [WL-01: Scope & Staged Vertical-Slice Execution](../.agents/skills/wl-01-scope-vertical-slice/SKILL.md) | Enforces staged vertical-slice scoping, single-question ambiguity gates, synthetic acceptance tests, and honest verification reporting. |
+| [WL-02: Georgia Law, Deadlines & GRPC Compliance](../.agents/skills/wl-02-georgia-law-grpc/SKILL.md) | Applies Georgia procedural law (`O.C.G.A. Title 9 Ch. 11`, `USCR`, `Title 24` Evidence), statutory deadline triggers, SB 68/SB 69 civil tort reforms, and GRPC/UPL supervision controls. |
+| [WL-03: Cloud SQL RLS, Action-Digest Approvals & Security Controls](../.agents/skills/wl-03-rls-digest-security/SKILL.md) | Enforces PostgreSQL `FORCE ROW LEVEL SECURITY`, restricted `NOBYPASSRLS` roles, intake vs. verified matter isolation, SHA-256 action-digest approvals, and untrusted content sandboxing. |
+| [WL-04: Source-Referenced Extraction, Coordinates & Scoped Postgres Retrieval](../.agents/skills/wl-04-source-extraction-retrieval/SKILL.md) | Manages minimal-copy `source_reference` provenance, Dropbox/Gmail version pinning, normalized top-left bounding boxes, Bates/line spans, and pre-filtered PostgreSQL retrieval. |
+| [WL-05: Python State Machine, Transactional Outbox & ADK Specialist Harness](../.agents/skills/wl-05-state-machine-adk-harness/SKILL.md) | Implements the deterministic Python workflow state machine, atomic inbox/outbox deduplication, at-least-once Pub/Sub safety, `NEEDS_RECONCILIATION` handling, and bounded Google ADK specialists. |
+| [WL-06: Deterministic Citation, Quote & Provenance Auditor (Independent Review)](../.agents/skills/wl-06-citation-provenance-auditor/SKILL.md) | Builds the mandatory Independent Review gate verifying statutory/case citations (`eyecite`), matter-scoped `source_reference` versions, and verbatim quote alignment (`rapidfuzz`) before `REVIEW_REQUIRED`. |
+| [WL-07: Attorney Command Center UI (Next.js / TypeScript)](../.agents/skills/wl-07-attorney-command-center-ui/SKILL.md) | Guides development of the Next.js/TypeScript Attorney Command Center for `REVIEW_REQUIRED`, `QUARANTINED`, and `NEEDS_RECONCILIATION` queues, coordinate-highlighted source previews, and digest-bound approvals. |
+| [WL-08: Reversible .docx OOXML Redline & Work-Product Compiler](../.agents/skills/wl-08-docx-ooxml-redline-compiler/SKILL.md) | Compiles reversible Microsoft Word (`.docx`) OOXML Tracked Changes (`<w:ins>`, `<w:del>`) and negotiation-safe margin comments from structured JSON diffs without exposing internal strategy. |
+| [WL-09: Authorized External Adapters (Clio, Dropbox, Gmail, Primary Law)](../.agents/skills/wl-09-authorized-external-adapters/SKILL.md) | Defines isolated Python `Protocol` boundaries and synthetic local test doubles for Clio, Dropbox, Gmail, Calendar, and primary law connectors with email-attachment family preservation. |
+| [WL-10: Synthetic Fixtures, Negative-Path Tests & Release Gates](../.agents/skills/wl-10-synthetic-fixtures-gates/SKILL.md) | Enforces 100% synthetic Georgia legal test fixtures and mandatory negative-path `pytest` suites covering quarantine routing, stale approvals, duplicate replay, ambiguous timeouts, and prompt injection. |
+
+Each directory contains `SKILL.md` and `agents/openai.yaml` for local discovery. Begin with `WL-01`; apply the other skills when their control is part of the current authorized slice. `WL-01`, `WL-03`, `WL-05`, and `WL-10` govern the PR1 synthetic correspondence control layer; `WL-02`, `WL-04`, `WL-06`, `WL-07`, `WL-08`, and `WL-09` define downstream roadmap controls without activating those components in PR1.
+
+Skills remain subordinate to the user's authorized task, [AGENTS.md](../AGENTS.md), [SECURITY.md](../SECURITY.md), and managing-attorney authority. They do not enable ADK/Gemini execution, live integrations, external effects, infrastructure, or deployment.

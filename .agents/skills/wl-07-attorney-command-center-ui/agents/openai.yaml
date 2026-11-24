@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-07: Attorney Command Center UI (Next.js / TypeScript)"
+  short_description: "Guides development of the Next.js/TypeScript Attorney Command Center for REVIEW_REQUIRED, QUARANTINED, and NEEDS_RECONCILIATION queues, coordinate-highlighted source previews, and digest-bound approvals."
+  default_prompt: "Use $wl-07-attorney-command-center-ui to apply WL-07: Attorney Command Center UI (Next.js / TypeScript) controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

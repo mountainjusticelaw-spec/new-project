@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-08: Reversible .docx OOXML Redline & Work-Product Compiler"
+  short_description: "Compiles reversible Microsoft Word (.docx) OOXML Tracked Changes (<w:ins>, <w:del>) and negotiation-safe margin comments from structured JSON diffs without exposing internal strategy."
+  default_prompt: "Use $wl-08-docx-ooxml-redline-compiler to apply WL-08: Reversible .docx OOXML Redline & Work-Product Compiler controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

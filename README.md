@@ -2,7 +2,7 @@
 
 Engineering repository for WeaverLawOS, an attorney-supervised, event-driven law-office AI operating system.
 
-**Status:** v0.1.0 Foundation (documentation and scaffolding only). No agents, integrations, cloud resources or production controls are implemented or deployed by this baseline.
+**Status:** Local synthetic correspondence control layer. Deterministic Python controls, an in-memory mock executor, and disposable PostgreSQL migrations and test suites are implemented; live PostgreSQL 16+ role/RLS verification (`WEAVERLAW_REQUIRE_LIVE_PG=1 python -m pytest -v`) is a required pre-merge local gate while GitHub Actions CI remains disabled. Model runtimes, live integrations, cloud resources, and production deployment remain disabled.
 
 ## Mission
 Convert authorized office events into evidence-backed work products and reviewable proposed actions. Preserve attorney judgment, confidentiality, authoritative case records and a complete audit trail.
@@ -16,7 +16,7 @@ Convert authorized office events into evidence-backed work products and reviewab
 - [First workflow](workflows/incoming-email/README.md): synthetic incoming correspondence review.
 
 ## Technology direction
-Python, Google ADK and Gemini via Google Cloud; Cloud Run, Pub/Sub, Scheduler, Cloud SQL/PostgreSQL, Secret Manager; a future Next.js/TypeScript command center. LangGraph or alternate model providers are optional adapters, not baseline dependencies.
+The locked future stack is Python, Google ADK, Gemini, and Cloud SQL for PostgreSQL; see [architecture decisions](docs/DECISIONS.md). Cloud Run, Pub/Sub, Scheduler, Secret Manager, and a Next.js/TypeScript command center remain future components. PR1 activates no model runtime or cloud service.
 
 ## Data and development
 Clio is the intended authoritative matter record; Dropbox is the intended original-document repository. GitHub stores software and non-client-specific templates only. Do not add client information, secrets, live transcripts, credentials, or case files. Use wholly synthetic fixtures. No installation or deployment command is required to review this baseline.

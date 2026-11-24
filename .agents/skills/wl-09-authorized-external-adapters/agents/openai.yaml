@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-09: Authorized External Adapters (Clio, Dropbox, Gmail, Primary Law)"
+  short_description: "Defines isolated Python Protocol boundaries and synthetic local test doubles for Clio, Dropbox, Gmail, Calendar, and primary law connectors with email-attachment family preservation."
+  default_prompt: "Use $wl-09-authorized-external-adapters to apply WL-09: Authorized External Adapters (Clio, Dropbox, Gmail, Primary Law) controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true
