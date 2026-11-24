@@ -1,0 +1,2 @@
+# Integration boundaries (planned)
+Adapter interfaces for Clio, Dropbox, Gmail, Google Calendar, licensed research and model providers. Separate read and effect capabilities; use least-privilege OAuth scopes and secret storage. ChatGPT connectors do not imply independent app API authorization. Test against mocks first; no real tokens or account connections. Validate contracts, quotas, pagination, retry semantics and permitted data use before live access.

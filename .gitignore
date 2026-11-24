@@ -1,14 +1,52 @@
-# What a project can make again, and nobody needs to keep.
-node_modules/
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+*credentials*.json
+*token*.json
+secrets/
+# Real data and operational artifacts
+client-data/
+matter-data/
+private-data/
+uploads/
+exports/
+logs/
+*.log
+*.sql.gz
+*.dump
+*.sqlite
+*.sqlite3
+# Python
+__pycache__/
+*.py[cod]
 .venv/
 venv/
-__pycache__/
-target/
-vendor/
-.gradle/
-DerivedData/
-.next/cache/
-.turbo/
-.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# JS
+node_modules/
+.next/
+dist/
+build/
+# Infrastructure state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+# Editors / OS
 .DS_Store
-*.log
+Thumbs.db
+.idea/
+.vscode/
