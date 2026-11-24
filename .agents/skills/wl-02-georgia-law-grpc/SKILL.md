@@ -16,7 +16,9 @@ description: >
      - **Civil Answer:** 30 days (`O.C.G.A. § 9-11-12(a)`); **Default Opening as of right:** 15 days (`O.C.G.A. § 9-11-55(a)`).
      - **Motor Vehicle Time-Limited Demands:** `O.C.G.A. § 9-11-67.1` (30-day minimum window + statutory terms).
      - **Contractual Attorney's Fees Notice:** 10 days (`O.C.G.A. § 13-1-11`).
-     - **Appellate Clocks:** 30 days Direct/Discretionary (`O.C.G.A. § 5-6-34(a)` / `§ 5-6-35`); 10+10 days Interlocutory (`O.C.G.A. § 5-6-34(b)`).
+     - **Direct Appeals:** Notice of Appeal due within 30 days after entry of an appealable decision or judgment under `O.C.G.A. § 5-6-38(a)`, for judgments appealable under `O.C.G.A. § 5-6-34(a)`, subject to shorter specific statutory clocks such as 7 days in dispossessory actions under `O.C.G.A. § 44-7-56`.
+     - **Interlocutory Appeals (`O.C.G.A. § 5-6-34(b)`):** Certificate of Immediate Review within 10 days of order entry; application within 10 days of certificate entry; AND Notice of Appeal within 10 days after entry of the order granting the application.
+     - **Discretionary Appeals (`O.C.G.A. § 5-6-35(d), (g)`):** Application within 30 days of order entry unless a shorter specific statute applies; AND Notice of Appeal within 10 days after entry of the order granting the application (`O.C.G.A. § 5-6-35(g)`).
    - **Apply SB 68 / SB 69 Civil Rules where relevant:** `O.C.G.A. § 9-11-12(j)` (90-day discovery stay on motion to dismiss), `O.C.G.A. § 9-11-41(a)` (60-day post-answer voluntary dismissal limit), `O.C.G.A. § 51-12-1.1` (billed vs. paid medical damages and LOP discoverability for post-April 21, 2025 injuries), `O.C.G.A. § 40-8-76.1`, `O.C.G.A. § 51-3-50`, and `O.C.G.A. § 51-12-15`.
    - Never substitute Federal Rules (FRCP/FRE) where Georgia's Civil Practice Act (`Title 9, Ch. 11`), `USCR`, or `Title 24` Evidence Code govern.
 
