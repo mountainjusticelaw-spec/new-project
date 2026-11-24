@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-01: Scope & Staged Vertical-Slice Execution"
+  short_description: "Enforces staged vertical-slice scoping, single-question ambiguity gates, synthetic acceptance tests, and honest verification reporting for WeaverLawOS."
+  default_prompt: "Use $wl-01-scope-vertical-slice to apply WL-01: Scope & Staged Vertical-Slice Execution controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

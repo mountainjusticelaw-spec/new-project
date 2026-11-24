@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-02: Georgia Law, Deadlines & GRPC Compliance"
+  short_description: "Applies Georgia procedural law (O.C.G.A. Title 9 Ch. 11, USCR, Title 24 Evidence), statutory deadline triggers, SB 68/SB 69 civil tort reforms, and GRPC/UPL supervision controls."
+  default_prompt: "Use $wl-02-georgia-law-grpc to apply WL-02: Georgia Law, Deadlines & GRPC Compliance controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

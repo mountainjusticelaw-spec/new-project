@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-06: Deterministic Citation, Quote & Provenance Auditor (Independent Review)"
+  short_description: "Builds the mandatory Independent Review gate verifying statutory/case citations (eyecite), matter-scoped source_reference versions, and verbatim quote alignment (rapidfuzz) before REVIEW_REQUIRED."
+  default_prompt: "Use $wl-06-citation-provenance-auditor to apply WL-06: Deterministic Citation, Quote & Provenance Auditor (Independent Review) controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

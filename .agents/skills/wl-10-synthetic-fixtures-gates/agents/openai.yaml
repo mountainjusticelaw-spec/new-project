@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-10: Synthetic Fixtures, Negative-Path Tests & Release Gates"
+  short_description: "Enforces 100% synthetic Georgia legal test fixtures and mandatory negative-path pytest suites covering quarantine routing, stale approvals, duplicate replay, ambiguous timeouts, and prompt injection."
+  default_prompt: "Use $wl-10-synthetic-fixtures-gates to apply WL-10: Synthetic Fixtures, Negative-Path Tests & Release Gates controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

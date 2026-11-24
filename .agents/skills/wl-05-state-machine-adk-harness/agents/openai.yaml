@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-05: Python State Machine, Transactional Outbox & ADK Specialist Harness"
+  short_description: "Implements the deterministic Python workflow state machine, atomic inbox/outbox deduplication, at-least-once Pub/Sub safety, NEEDS_RECONCILIATION handling, and bounded Google ADK specialists."
+  default_prompt: "Use $wl-05-state-machine-adk-harness to apply WL-05: Python State Machine, Transactional Outbox & ADK Specialist Harness controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true
