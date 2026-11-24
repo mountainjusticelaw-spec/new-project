@@ -1,6 +1,6 @@
 # Proposed architecture — v0.1
 
-Status: proposed deployment architecture, not deployed. The future Google ADK + Gemini + Cloud SQL for PostgreSQL stack is locked by [ADR-002](docs/DECISIONS.md). PR1 implements only local deterministic controls and synthetic tests; versions, availability, quotas, costs and data terms must be confirmed before provisioning.
+Status: proposed deployment architecture, not deployed. The future Google ADK + Gemini + Cloud SQL for PostgreSQL stack is locked by [ADR-002](docs/DECISIONS.md). PR1 implements local deterministic controls, synthetic unit tests, and disposable PostgreSQL migrations/suites whose live PostgreSQL 16+ execution (`WEAVERLAW_REQUIRE_LIVE_PG=1 python -m pytest -v`) is a required pre-merge gate (GitHub Actions CI is not yet enabled); versions, availability, quotas, costs and data terms must be confirmed before provisioning.
 
 ## Goals
 An incoming event or human request becomes a durable, matter-scoped job; deterministic orchestration invokes bounded specialists; source-linked findings and proposed actions reach an attorney review queue. Only an authorized executor can perform an approved external effect. The agent never bypasses policy.

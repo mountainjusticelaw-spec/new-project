@@ -611,3 +611,172 @@ def test_approve_and_execute_deny_if_independent_review_not_recorded():
         )
     assert checked_run.status == State.APPROVED
     assert not exe2.effects and tuple(checked_run.audit) == before_exec
+
+
+def test_direct_run_move_cannot_validate_or_quarantine_unverified_received_run():
+    from types import MappingProxyType
+
+    intake = Intake(resolver())
+    run, created = intake.ingest_event(event(), ['clio-001'])
+    assert created and run.status == State.RECEIVED
+    before = (
+        run.status,
+        run.matter_id,
+        run.resolved_matter_id,
+        run.resolution_evidence,
+        tuple(run.audit),
+    )
+
+    # Copilot reproduction: Matter A ('clio-001' -> MATTER) cannot be moved to Matter B (OTHER)
+    # or even MATTER via direct Run.move() with resolution_evidence=None.
+    for claimed_matter in (OTHER, MATTER):
+        with pytest.raises(Denied):
+            run.move(
+                State.RECEIVED, State.VALIDATED, Actor.RESOLVER,
+                NOW, 'MATTER_VERIFIED', resolved_matter=claimed_matter,
+            )
+
+    # Forged snapshot via internal _move() without intake authorization or matching evidence fails.
+    forged_snapshot = MappingProxyType({
+        'run_id': str(run.run_id),
+        'inbox_id': run.intake_evidence['inbox_id'],
+        'source_reference': 'synthetic-message-001',
+        'source_version': 'v1',
+        'extracted_signals': ('clio-002',),
+        'matched_clio_ids': ('clio-002',),
+        'mapping_version': MappingProxyType({'clio-002': 'v1'}),
+        'decision': 'VALIDATED',
+        'reason_code': 'MATTER_VERIFIED',
+    })
+    with pytest.raises(Denied):
+        run._move(
+            State.RECEIVED, State.VALIDATED, Actor.RESOLVER,
+            NOW, 'MATTER_VERIFIED', resolved_matter=OTHER,
+            resolution_evidence=forged_snapshot,
+        )
+    with pytest.raises(Denied):
+        run._move(
+            State.RECEIVED, State.VALIDATED, Actor.RESOLVER,
+            NOW, 'MATTER_VERIFIED', resolved_matter=OTHER,
+            resolution_evidence=forged_snapshot,
+            _intake_token=intake._auth_token,
+        )
+
+    # Direct initial quarantine via Run.move() is also rejected so resolution_evidence is required.
+    for q_reason in ('UNMAPPED_MATTER_SIGNAL', 'CONFLICTING_REPLAY_SIGNALS', 'MATTER_INELIGIBLE'):
+        with pytest.raises(Denied):
+            run.move(State.RECEIVED, State.QUARANTINED, Actor.RESOLVER, NOW, q_reason)
+        with pytest.raises(Denied):
+            run._move(
+                State.RECEIVED, State.QUARANTINED, Actor.RESOLVER,
+                NOW, q_reason, safety_quarantine=True,
+            )
+
+    assert (
+        run.status,
+        run.matter_id,
+        run.resolved_matter_id,
+        run.resolution_evidence,
+        tuple(run.audit),
+    ) == before
+
+    # Supported Intake.resolve_run() still succeeds cleanly and binds scope + snapshot atomically.
+    assert intake.resolve_run(run, now=NOW) == (State.VALIDATED, MATTER, 'MATTER_VERIFIED')
+    assert run.status == State.VALIDATED
+    assert run.matter_id == MATTER and run.resolved_matter_id == MATTER
+    assert run.resolution_evidence is not None
+    assert run.resolution_evidence['matched_clio_ids'] == ('clio-001',)
+    assert [entry.target for entry in run.audit] == [State.RECEIVED, State.VALIDATED]
+
+
+def test_direct_run_move_edges_enforce_resolution_quarantine_and_executor_bindings():
+    from services.correspondence.core import (
+        AcceptedApproval,
+        Approval,
+        MockPolicyExecutor,
+        Proposal,
+    )
+
+    # 1. Tampered unverified VALIDATED state cannot advance to RUNNING, FAILED, or CANCELLED.
+    intake_unverified = Intake(resolver())
+    unverified, _ = intake_unverified.ingest_event(event(), ['clio-001'])
+    unverified.status = State.VALIDATED
+    unverified.matter_id = OTHER
+    unverified_audit = tuple(unverified.audit)
+    for target in (State.RUNNING, State.FAILED, State.CANCELLED):
+        with pytest.raises(Denied):
+            unverified.move(State.VALIDATED, target, Actor.COORDINATOR, NOW, 'BYPASS')
+    assert unverified.matter_id == OTHER and tuple(unverified.audit) == unverified_audit
+
+    # 2. Eligible resolved run rejects direct quarantine and unreviewed downstream transitions.
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    resolved_audit = tuple(run.audit)
+    for q_reason in ('MATTER_INELIGIBLE', 'CONFLICTING_REPLAY_SIGNALS'):
+        with pytest.raises(Denied):
+            run.move(State.VALIDATED, State.QUARANTINED, Actor.RESOLVER, NOW, q_reason)
+        with pytest.raises(Denied):
+            run._move(
+                State.VALIDATED, State.QUARANTINED, Actor.RESOLVER,
+                NOW, q_reason, safety_quarantine=True,
+            )
+    assert run.status == State.VALIDATED and run.matter_id == MATTER
+    assert tuple(run.audit) == resolved_audit
+
+    intake.start(run, NOW)
+    intake.review(run, NOW, independently_checked=True)
+    reviewed_audit = tuple(run.audit)
+
+    p = Proposal(
+        run.run_id, MATTER, FIRM, 'mock.review', 'synthetic-sink',
+        'draft-only', (('synthetic-message-001', 'v1'),), 'p1',
+    )
+    a = Approval(
+        run.run_id, FIRM, MATTER, UUID(int=10), p.action_digest,
+        p.destination, p.policy_version, NOW + timedelta(minutes=5),
+    )
+    forged_accepted = AcceptedApproval(
+        approval_id=a.approval_id, proposal_id=p.proposal_id, run_id=run.run_id,
+        firm_id=FIRM, verified_matter_id=MATTER, reviewer_id=a.reviewer_id,
+        action_digest=p.action_digest, source_reference_versions=p.source_versions,
+        proposal=p, approval=a,
+    )
+
+    # 3. Direct move/_move to APPROVED fails without MockPolicyExecutor.approve().
+    with pytest.raises(Denied):
+        run.move(State.REVIEW_REQUIRED, State.APPROVED, Actor.ATTORNEY, NOW, 'BYPASS')
+    with pytest.raises(Denied):
+        run._move(
+            State.REVIEW_REQUIRED, State.APPROVED, Actor.ATTORNEY,
+            NOW, 'BYPASS', mock=True, accepted_approval=forged_accepted,
+        )
+    assert run.status == State.REVIEW_REQUIRED and run.accepted_approval is None
+    assert tuple(run.audit) == reviewed_audit
+
+    # 4. After legitimate approve(), direct move/_move to EXECUTING/COMPLETED/NEEDS_RECONCILIATION
+    # fails without MockPolicyExecutor.execute().
+    exe = MockPolicyExecutor()
+    exe.approve(run, p, a, p.source_versions, NOW, permitted=True)
+    approved_audit = tuple(run.audit)
+
+    with pytest.raises(Denied):
+        run.move(State.APPROVED, State.EXECUTING, Actor.POLICY_EXECUTOR, NOW, 'BYPASS')
+    with pytest.raises(Denied):
+        run._move(
+            State.APPROVED, State.EXECUTING, Actor.POLICY_EXECUTOR,
+            NOW, 'BYPASS', mock=True, leased_digest=p.action_digest,
+        )
+    assert run.status == State.APPROVED and not exe.effects
+    assert tuple(run.audit) == approved_audit
+
+    # Even if status is forced to EXECUTING in memory, completion without an active lease fails.
+    run.status = State.EXECUTING
+    for terminal_target in (State.COMPLETED, State.NEEDS_RECONCILIATION):
+        with pytest.raises(Denied):
+            run.move(State.EXECUTING, terminal_target, Actor.POLICY_EXECUTOR, NOW, 'BYPASS')
+        with pytest.raises(Denied):
+            run._move(
+                State.EXECUTING, terminal_target, Actor.POLICY_EXECUTOR,
+                NOW, 'BYPASS', mock=True, leased_digest=p.action_digest,
+            )
+    assert not exe.effects and tuple(run.audit) == approved_audit

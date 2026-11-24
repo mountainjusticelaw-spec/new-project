@@ -87,7 +87,7 @@ WEAVERLAW_REQUIRE_LIVE_PG=1 python -m pytest tests/test_postgres_live.py -k pool
 
 The required live gate must have zero skipped tests and zero errors. Report actual test counts and the exact pytest summary, environment versions, compilation/diff-check results, and working-tree state; do not hard-code a stale count into the contract. Coverage includes post-validation restriction, bound/mismatched resolution evidence, immutable evidence writes, contradictory duplicate replay, duplicate/CAS concurrency, two-session mapping revocation, forced RLS, temporary-trigger forgery, table shadowing, audit rollback, and pool cleanup. No real provider credentials or client records are needed.
 
-Require independent code/SQL review and owner acceptance before merge. No Cloud SQL migration or deployment is performed by this gate. Rollback for this slice is branch/PR review and disposal of the fresh local test cluster; do not drop real data or roles.
+Require recorded execution of this disposable local PostgreSQL 16+ gate (since GitHub Actions CI is not yet enabled on PR #1), independent code/SQL review, and owner acceptance before merge. No Cloud SQL migration or deployment is performed by this gate. Rollback for this slice is branch/PR review and disposal of the fresh local test cluster; do not drop real data or roles.
 
 ## Phase 2 boundary
 

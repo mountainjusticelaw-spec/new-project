@@ -2,7 +2,7 @@
 
 Engineering repository for WeaverLawOS, an attorney-supervised, event-driven law-office AI operating system.
 
-**Status:** Local synthetic correspondence control layer. Deterministic Python controls, an in-memory mock executor, and disposable PostgreSQL tests are implemented. Model runtimes, live integrations, cloud resources, and production deployment remain disabled.
+**Status:** Local synthetic correspondence control layer. Deterministic Python controls, an in-memory mock executor, and disposable PostgreSQL migrations and test suites are implemented; live PostgreSQL 16+ role/RLS verification (`WEAVERLAW_REQUIRE_LIVE_PG=1 python -m pytest -v`) is a required pre-merge local gate while GitHub Actions CI remains disabled. Model runtimes, live integrations, cloud resources, and production deployment remain disabled.
 
 ## Mission
 Convert authorized office events into evidence-backed work products and reviewable proposed actions. Preserve attorney judgment, confidentiality, authoritative case records and a complete audit trail.

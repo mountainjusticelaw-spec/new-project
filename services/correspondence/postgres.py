@@ -161,13 +161,22 @@ def revalidate_matter_eligibility(conn, *, firm_id, matter_id, run_id):
     return eligible
 
 
-def transition(conn, *, firm_id, matter_id, run_id, expected, target, actor, reason, independently_checked=False):
+def transition(
+    conn, *, firm_id, matter_id, run_id, expected, target, actor, reason,
+    independently_checked=False,
+):
     """Trusted role dispatch with continuous eligibility and atomic CAS/audit."""
     if target == State.REVIEW_REQUIRED and independently_checked is not True:
         raise Denied('independent review required')
+    if independently_checked is not False and (
+        independently_checked is not True
+        or (expected, target, actor)
+        != (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW)
+    ):
+        raise Denied('independent review binding denied')
     if expected == State.RECEIVED or actor == Actor.RESOLVER or matter_id is None:
         raise Denied('use dedicated resolution path')
-    check_edge(expected,target,actor,matter_id,reason)
+    check_edge(expected, target, actor, matter_id, reason)
     _idle(conn)
     with conn.transaction(), conn.cursor() as cur:
         _scope(cur,firm_id,matter_id)

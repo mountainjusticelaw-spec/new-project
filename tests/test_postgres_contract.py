@@ -156,6 +156,12 @@ def test_transition_guards_independent_review_and_resolution_path():
         )
     with pytest.raises(Denied):
         transition(
+            conn, firm_id=UUID(int=1), matter_id=UUID(int=2), run_id=UUID(int=3),
+            expected=State.VALIDATED, target=State.RUNNING,
+            actor=Actor.COORDINATOR, reason='START', independently_checked=True,
+        )
+    with pytest.raises(Denied):
+        transition(
             conn, firm_id=UUID(int=1), matter_id=None, run_id=UUID(int=3),
             expected=State.RECEIVED, target=State.VALIDATED,
             actor=Actor.RESOLVER, reason='MATTER_VERIFIED',
