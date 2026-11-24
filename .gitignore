@@ -1,0 +1,52 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+*credentials*.json
+*token*.json
+secrets/
+# Real data and operational artifacts
+client-data/
+matter-data/
+private-data/
+uploads/
+exports/
+logs/
+*.log
+*.sql.gz
+*.dump
+*.sqlite
+*.sqlite3
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# JS
+node_modules/
+.next/
+dist/
+build/
+# Infrastructure state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

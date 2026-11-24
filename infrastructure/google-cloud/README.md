@@ -1,0 +1,2 @@
+# Google Cloud infrastructure (planned)
+No Terraform resources, cloud projects, billing, service accounts, APIs or deployments created. Before implementation, confirm actual project/account, region, quotas, budget, data terms and owner. Plan dev-only resources with reviewed IaC, least-privilege identities, short-lived federation, private services, monitoring and restore plan. Separate production approval required. See [architecture](../../ARCHITECTURE.md).

@@ -1,0 +1,2 @@
+# Delivery governance
+No GitHub Actions workflow or deployment automation is enabled by these files. Future CI should run lint, tests, dependency/secret checks with minimal permissions and synthetic fixtures; pin dependencies/actions and review third-party access. Protect main and production environments where supported after separate approval. Cloud authentication via short-lived workload identity federation, not stored keys. No production deployment without approved release and rollback plan.

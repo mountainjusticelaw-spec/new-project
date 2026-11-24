@@ -1,0 +1,2 @@
+# Test and evaluation plan
+No test suite exists yet. Add deterministic unit/contract tests before behavior, synthetic integration and end-to-end tests, adversarial agent evaluation and negative authorization paths. Required: duplicate events, ambiguous matter, source gaps, malformed outputs, injection, cross-matter access, rejected/stale approvals, retry and ambiguous external effects. Record test command, version, result and limitations. No live data or credentials.
