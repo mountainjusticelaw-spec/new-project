@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +31,7 @@ MIGRATION_SQL = REPO_ROOT / 'database' / 'migrations' / '001_correspondence_cont
 TEST_SQL = REPO_ROOT / 'database' / 'tests' / '001_correspondence_control_layer_test.sql'
 
 ROLES = ('wl_intake', 'wl_resolver', 'wl_worker', 'wl_reviewer', 'wl_attorney', 'wl_executor')
+ALL_RESTRICTED_ROLES = (*ROLES, 'wl_audit_writer')
 ALL_TABLES = (
     'matter_mapping', 'event_inbox', 'workflow_run', 'outbox', 'audit_event',
     'workflow_step', 'agent_run', 'source_reference', 'work_product',
@@ -44,6 +46,7 @@ FIRM_A = UUID('00000000-0000-0000-0000-000000000101')
 MATTER_A = UUID('00000000-0000-0000-0000-000000000201')
 MATTER_B = UUID('00000000-0000-0000-0000-000000000202')
 MATTER_CLOSED = UUID('00000000-0000-0000-0000-000000000203')
+MATTER_RACE = UUID('00000000-0000-0000-0000-000000000209')
 NOW = datetime(2026, 11, 23, 14, 0, tzinfo=UTC)
 
 
@@ -229,8 +232,8 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
     with _connect(seeded_cluster) as admin:
         rls_rows = admin.execute(
             """SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
-               FROM pg_class c
-               JOIN pg_namespace n ON n.oid = c.relnamespace
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                WHERE n.nspname = 'weaverlaw' AND c.relkind = 'r'"""
         ).fetchall()
         assert {row[0] for row in rls_rows} == set(ALL_TABLES)
@@ -238,10 +241,10 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
 
         role_rows = admin.execute(
             """SELECT rolname, rolcanlogin, rolsuper, rolbypassrls
-               FROM pg_roles WHERE rolname = ANY(%s)""",
-            (list(ROLES),),
+               FROM pg_catalog.pg_roles WHERE rolname = ANY(%s)""",
+            (list(ALL_RESTRICTED_ROLES),),
         ).fetchall()
-        assert {row[0] for row in role_rows} == set(ROLES)
+        assert {row[0] for row in role_rows} == set(ALL_RESTRICTED_ROLES)
         assert all((not can_login and not is_super and not bypass_rls)
                    for _, can_login, is_super, bypass_rls in role_rows)
 
@@ -272,17 +275,19 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
     for role in ('wl_worker', 'wl_reviewer', 'wl_attorney'):
         with _connect(seeded_cluster, role) as conn, conn.transaction():
             conn.execute(
-                "SELECT set_config('app.verified_firm_id', %s, true), "
-                "set_config('app.verified_matter_id', %s, true)",
+                "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                "pg_catalog.set_config('app.verified_matter_id', %s, true)",
                 (str(FIRM_A), str(MATTER_A)),
             )
             visible_runs = conn.execute(
-                'SELECT run_id, verified_matter_id, status FROM weaverlaw.workflow_run'
+                'SELECT run_id, verified_matter_id, status FROM weaverlaw.workflow_run '
+                'WHERE run_id = ANY(%s)',
+                ([run_a, run_b, run_q],),
             ).fetchall()
             assert visible_runs == [(run_a, MATTER_A, 'VALIDATED')]
             for table in TIER_B_TABLES:
                 matters = conn.execute(
-                    f'SELECT verified_matter_id FROM weaverlaw.{table}'
+                    f'SELECT DISTINCT verified_matter_id FROM weaverlaw.{table}'
                 ).fetchall()
                 assert matters == [(MATTER_A,)], f'{role} leaked rows on {table}: {matters}'
 
@@ -292,8 +297,8 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
             for table in TIER_B_TABLES:
                 with pytest.raises(psycopg.errors.InsufficientPrivilege), conn.transaction():
                     conn.execute(
-                        "SELECT set_config('app.verified_firm_id', %s, true), "
-                        "set_config('app.verified_matter_id', %s, true)",
+                        "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                        "pg_catalog.set_config('app.verified_matter_id', %s, true)",
                         (str(FIRM_A), str(MATTER_A)),
                     )
                     conn.execute(f'SELECT count(*) FROM weaverlaw.{table}').fetchone()
@@ -301,8 +306,8 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
     # wl_intake cannot see MATTER_VERIFIED promoted runs, only INTAKE_RESTRICTED quarantined/received runs
     with _connect(seeded_cluster, 'wl_intake') as intake_conn, intake_conn.transaction():
         intake_conn.execute(
-            "SELECT set_config('app.verified_firm_id', %s, true), "
-            "set_config('app.verified_matter_id', %s, true)",
+            "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+            "pg_catalog.set_config('app.verified_matter_id', %s, true)",
             (str(FIRM_A), str(MATTER_A)),
         )
         intake_statuses = {
@@ -364,8 +369,8 @@ def test_scope_promotion_and_audit_atomicity_immutability_and_rollback(seeded_cl
             ('REVIEW_REQUIRED', 'REJECTED', 'wl_attorney', 'MATTER_VERIFIED', MATTER_A),
         ]
 
-        # Prove UPDATE, DELETE, and TRUNCATE on audit_event fail for all 6 roles
-        for role in ROLES:
+        # Prove UPDATE, DELETE, and TRUNCATE on audit_event fail for all restricted roles (including wl_audit_writer)
+        for role in ALL_RESTRICTED_ROLES:
             with _connect(seeded_cluster, role) as role_conn:
                 for stmt in (
                     "UPDATE weaverlaw.audit_event SET reason_code = 'TAMPER'",
@@ -375,26 +380,31 @@ def test_scope_promotion_and_audit_atomicity_immutability_and_rollback(seeded_cl
                     with pytest.raises(psycopg.errors.InsufficientPrivilege), role_conn.transaction():
                         role_conn.execute(stmt)
 
-        # Prove direct forged INSERT into audit_event outside trigger fails RLS (pg_trigger_depth() == 0)
-        with pytest.raises(psycopg.errors.InsufficientPrivilege), worker_conn.transaction():
-            worker_conn.execute(
-                "SELECT set_config('app.verified_firm_id', %s, true), "
-                "set_config('app.verified_matter_id', %s, true)",
-                (str(FIRM_A), str(MATTER_A)),
-            )
-            worker_conn.execute(
-                """INSERT INTO weaverlaw.audit_event
-                   (firm_id, run_id, scope_mode, verified_matter_id, old_status, new_status, actor, reason_code)
-                   VALUES (%s, %s, 'MATTER_VERIFIED', %s, 'REJECTED', 'REJECTED', 'wl_worker', 'FORGED')""",
-                (FIRM_A, run_id, MATTER_A),
-            )
+        # Prove direct INSERT into audit_event fails for all 6 application roles (INSERT revoked)
+        for role in ROLES:
+            with (
+                _connect(seeded_cluster, role) as role_conn,
+                pytest.raises(psycopg.errors.InsufficientPrivilege),
+                role_conn.transaction(),
+            ):
+                role_conn.execute(
+                    "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                    "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+                    (str(FIRM_A), str(MATTER_A)),
+                )
+                role_conn.execute(
+                    """INSERT INTO weaverlaw.audit_event
+                       (firm_id, run_id, scope_mode, verified_matter_id, old_status, new_status, actor, reason_code)
+                       VALUES (%s, %s, 'MATTER_VERIFIED', %s, 'REJECTED', 'REJECTED', %s, 'FORGED')""",
+                    (FIRM_A, run_id, MATTER_A, role),
+                )
 
-        # Prove simulated audit-insert failure completely rolls back workflow_run transition
+        # Prove simulated audit-insert failure (revoking wl_audit_writer INSERT) rolls back workflow_run transition
         run_rb, _ = receive(
             intake_conn, _make_envelope(source_ref='synthetic-audit-rollback'), trusted_firm_id=FIRM_A,
         )
         resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_rb, trusted_signals=['clio-live-a'])
-        admin.execute('REVOKE INSERT ON weaverlaw.audit_event FROM wl_worker')
+        admin.execute('REVOKE INSERT ON weaverlaw.audit_event FROM wl_audit_writer')
         try:
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 transition(
@@ -407,7 +417,149 @@ def test_scope_promotion_and_audit_atomicity_immutability_and_rollback(seeded_cl
             ).fetchone()[0]
             assert persisted_status == 'VALIDATED'
         finally:
-            admin.execute('GRANT INSERT ON weaverlaw.audit_event TO wl_worker')
+            admin.execute('GRANT INSERT ON weaverlaw.audit_event TO wl_audit_writer')
+
+
+def test_pg_temp_trigger_cannot_forge_audit_event(seeded_cluster):
+    import psycopg.errors
+
+    with (
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+        _connect(seeded_cluster) as admin,
+    ):
+        run_id, created = receive(
+            intake_conn, _make_envelope(source_ref='synthetic-temp-trig-001'), trusted_firm_id=FIRM_A,
+        )
+        assert created is True and run_id is not None
+        assert resolve_run(
+            resolver_conn, firm_id=FIRM_A, run_id=run_id, trusted_signals=['clio-live-a'],
+        ) == (State.VALIDATED, MATTER_A, 'MATTER_VERIFIED')
+
+    for role in ('wl_intake', 'wl_resolver', 'wl_worker', 'wl_reviewer', 'wl_attorney'):
+        with _connect(seeded_cluster, role) as attacker_conn:
+            # 1. Custom TEMP TABLE + AFTER INSERT trigger incrementing pg_trigger_depth() > 0
+            with pytest.raises(psycopg.errors.InsufficientPrivilege), attacker_conn.transaction():
+                attacker_conn.execute(
+                    "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                    "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+                    (str(FIRM_A), str(MATTER_A)),
+                )
+                attacker_conn.execute('CREATE TEMP TABLE temp_audit_driver (id integer)')
+                attacker_conn.execute(
+                    f"""CREATE FUNCTION pg_temp.forge_audit_via_temp_trigger() RETURNS trigger
+                        LANGUAGE plpgsql AS $$
+                        BEGIN
+                         INSERT INTO weaverlaw.audit_event
+                          (firm_id, run_id, scope_mode, verified_matter_id, old_status, new_status, actor, reason_code)
+                         VALUES
+                          ('{FIRM_A}'::pg_catalog.uuid, '{run_id}'::pg_catalog.uuid,
+                           'MATTER_VERIFIED'::weaverlaw.scope_mode, '{MATTER_A}'::pg_catalog.uuid,
+                           'VALIDATED'::weaverlaw.run_status, 'APPROVED'::weaverlaw.run_status,
+                           'wl_attorney', 'FORGED_VIA_TEMP');
+                         RETURN NEW;
+                        END $$"""
+                )
+                attacker_conn.execute(
+                    """CREATE TRIGGER forge_audit_after_insert
+                       AFTER INSERT ON pg_temp.temp_audit_driver
+                       FOR EACH ROW EXECUTE FUNCTION pg_temp.forge_audit_via_temp_trigger()"""
+                )
+                attacker_conn.execute('INSERT INTO pg_temp.temp_audit_driver VALUES (1)')
+
+            # 2. Attaching weaverlaw.audit_run_edge() directly to a TEMP TABLE must also fail
+            with pytest.raises(psycopg.errors.InsufficientPrivilege), attacker_conn.transaction():
+                attacker_conn.execute('CREATE TEMP TABLE fake_workflow_run (LIKE weaverlaw.workflow_run)')
+                attacker_conn.execute(
+                    """CREATE TRIGGER hijack_audit_writer
+                       AFTER INSERT ON pg_temp.fake_workflow_run
+                       FOR EACH ROW EXECUTE FUNCTION weaverlaw.audit_run_edge()"""
+                )
+
+    with _connect(seeded_cluster) as admin:
+        forged_count = admin.execute(
+            "SELECT count(*) FROM weaverlaw.audit_event WHERE reason_code = 'FORGED_VIA_TEMP'"
+        ).fetchone()[0]
+        assert forged_count == 0
+
+
+def test_temp_table_shadowing_cannot_hijack_mapping_or_audit(seeded_cluster):
+    import psycopg.errors
+
+    with (
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+        _connect(seeded_cluster, 'wl_worker') as worker_conn,
+        _connect(seeded_cluster) as admin,
+    ):
+        shadow_run_id, created = receive(
+            intake_conn, _make_envelope(source_ref='synthetic-temp-shadow-001'), trusted_firm_id=FIRM_A,
+        )
+        assert created is True and shadow_run_id is not None
+
+        # Verify wl_resolver cannot mutate weaverlaw.matter_mapping despite FOR SHARE lock policy
+        with pytest.raises(psycopg.errors.InsufficientPrivilege), resolver_conn.transaction():
+            resolver_conn.execute(
+                "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true)",
+                (str(FIRM_A),),
+            )
+            resolver_conn.execute(
+                "UPDATE weaverlaw.matter_mapping SET eligibility = 'OPEN' "
+                "WHERE clio_matter_id = 'clio-live-closed'"
+            )
+
+        # Create shadowing TEMP tables on resolver_conn (persisting across transactions)
+        resolver_conn.execute(
+            """CREATE TEMP TABLE matter_mapping (
+                   firm_id uuid, verified_matter_id uuid,
+                   clio_matter_id text, eligibility text, mapping_version text
+               )"""
+        )
+        resolver_conn.execute(
+            "INSERT INTO pg_temp.matter_mapping VALUES (%s, %s, 'clio-live-closed', 'OPEN', 'v-shadow')",
+            (FIRM_A, MATTER_A),
+        )
+        resolver_conn.execute(
+            """CREATE TEMP TABLE audit_event (
+                   audit_id bigint, firm_id uuid, run_id uuid, scope_mode text,
+                   verified_matter_id uuid, old_status text, new_status text,
+                   actor text, reason_code text, occurred_at timestamptz
+               )"""
+        )
+
+        # resolve_run must ignore pg_temp.matter_mapping ('OPEN') and enforce weaverlaw.matter_mapping ('CLOSED')
+        outcome = resolve_run(
+            resolver_conn, firm_id=FIRM_A, run_id=shadow_run_id, trusted_signals=['clio-live-closed'],
+        )
+        assert outcome == (State.QUARANTINED, None, 'MATTER_INELIGIBLE')
+        assert resolver_conn.execute('SELECT count(*) FROM pg_temp.audit_event').fetchone()[0] == 0
+
+        persisted = admin.execute(
+            'SELECT status, scope_mode, verified_matter_id, reason_code '
+            'FROM weaverlaw.workflow_run WHERE run_id = %s',
+            (shadow_run_id,),
+        ).fetchone()
+        assert persisted == ('QUARANTINED', 'INTAKE_RESTRICTED', None, 'MATTER_INELIGIBLE')
+
+        # Also verify transition() ignores pg_temp.workflow_run and pg_temp.audit_event
+        valid_run_id, _ = receive(
+            intake_conn, _make_envelope(source_ref='synthetic-temp-shadow-002'), trusted_firm_id=FIRM_A,
+        )
+        assert resolve_run(
+            resolver_conn, firm_id=FIRM_A, run_id=valid_run_id, trusted_signals=['clio-live-a'],
+        ) == (State.VALIDATED, MATTER_A, 'MATTER_VERIFIED')
+
+        worker_conn.execute('CREATE TEMP TABLE workflow_run (LIKE weaverlaw.workflow_run)')
+        worker_conn.execute('CREATE TEMP TABLE audit_event (LIKE weaverlaw.audit_event)')
+        transition(
+            worker_conn, firm_id=FIRM_A, matter_id=MATTER_A, run_id=valid_run_id,
+            expected=State.VALIDATED, target=State.RUNNING,
+            actor=Actor.COORDINATOR, reason='START',
+        )
+        assert worker_conn.execute('SELECT count(*) FROM pg_temp.audit_event').fetchone()[0] == 0
+        assert admin.execute(
+            'SELECT status FROM weaverlaw.workflow_run WHERE run_id = %s', (valid_run_id,),
+        ).fetchone()[0] == 'RUNNING'
 
 
 def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
@@ -417,7 +569,7 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
     workers = 6
     barrier = threading.Barrier(workers)
 
-    def submit_duplicate(idx: int):
+    def submit_duplicate(_idx: int):
         env = _make_envelope(source_ref='synthetic-concurrent-dedup-001', event_id=uuid4())
         with _connect(seeded_cluster, 'wl_intake') as conn:
             barrier.wait(timeout=10)
@@ -474,7 +626,7 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
         assert final_status == cas_winners[0].value
         assert audit_count == 3  # RECEIVED + VALIDATED + single winning transition
 
-    # (c) Mapping eligibility revocation enforced inside enforce_run_edge trigger
+    # (c) Direct SQL enforce_run_edge check on closed mapping
     with (
         _connect(seeded_cluster, 'wl_intake') as intake_conn,
         _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
@@ -484,8 +636,8 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
         )
         with pytest.raises(psycopg.errors.RaiseException), resolver_conn.transaction():
             resolver_conn.execute(
-                "SELECT set_config('app.verified_firm_id', %s, true), "
-                "set_config('app.verified_matter_id', %s, true)",
+                "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                "pg_catalog.set_config('app.verified_matter_id', %s, true)",
                 (str(FIRM_A), str(MATTER_CLOSED)),
             )
             resolver_conn.execute(
@@ -495,6 +647,95 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
                    WHERE run_id = %s AND status = 'RECEIVED'""",
                 (MATTER_CLOSED, revoked_run),
             )
+
+
+def test_concurrent_mapping_revocation_two_session_race(seeded_cluster):
+    with (
+        _connect(seeded_cluster) as admin_seed,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+    ):
+        with admin_seed.transaction():
+            admin_seed.execute(
+                """INSERT INTO weaverlaw.matter_mapping
+                   (firm_id, verified_matter_id, clio_matter_id, eligibility, mapping_version)
+                   VALUES (%s, %s, 'clio-live-race', 'OPEN', 'v1')
+                   ON CONFLICT (firm_id, verified_matter_id)
+                   DO UPDATE SET eligibility = 'OPEN'""",
+                (FIRM_A, MATTER_RACE),
+            )
+        race_run_id, created = receive(
+            intake_conn,
+            _make_envelope(source_ref='synthetic-two-session-revoke-001'),
+            trusted_firm_id=FIRM_A,
+        )
+        assert created is True and race_run_id is not None
+
+    start_barrier = threading.Barrier(2)
+
+    with (
+        _connect(seeded_cluster) as session_a,
+        _connect(seeded_cluster, 'wl_resolver') as session_b,
+        _connect(seeded_cluster) as monitor,
+    ):
+        resolver_pid = session_b.info.backend_pid
+
+        def run_concurrent_resolver():
+            start_barrier.wait(timeout=10)
+            return resolve_run(
+                session_b,
+                firm_id=FIRM_A,
+                run_id=race_run_id,
+                trusted_signals=['clio-live-race'],
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with session_a.transaction():
+                # Session A acquires row lock revoking eligibility -> CLOSED without committing yet
+                session_a.execute(
+                    """UPDATE weaverlaw.matter_mapping
+                       SET eligibility = 'CLOSED'
+                       WHERE firm_id = %s AND clio_matter_id = 'clio-live-race'""",
+                    (FIRM_A,),
+                )
+                future = pool.submit(run_concurrent_resolver)
+                start_barrier.wait(timeout=10)
+
+                # Deterministically verify Session B blocked on FOR SHARE Lock before Session A commits
+                deadline = time.monotonic() + 5.0
+                blocked_on_lock = False
+                while time.monotonic() < deadline:
+                    wait_row = monitor.execute(
+                        'SELECT wait_event_type FROM pg_catalog.pg_stat_activity WHERE pid = %s',
+                        (resolver_pid,),
+                    ).fetchone()
+                    if wait_row and wait_row[0] == 'Lock':
+                        blocked_on_lock = True
+                        break
+                    time.sleep(0.01)
+                assert blocked_on_lock, (
+                    'resolve_run did not serialize on FOR SHARE lock against concurrent mapping revocation'
+                )
+                # Exiting `with session_a.transaction():` commits eligibility = 'CLOSED'
+
+            outcome = future.result(timeout=10)
+            assert outcome == (State.QUARANTINED, None, 'MATTER_INELIGIBLE')
+
+        run_row = monitor.execute(
+            """SELECT status, scope_mode, verified_matter_id, reason_code
+               FROM weaverlaw.workflow_run WHERE run_id = %s""",
+            (race_run_id,),
+        ).fetchone()
+        assert run_row == ('QUARANTINED', 'INTAKE_RESTRICTED', None, 'MATTER_INELIGIBLE')
+
+        audit_rows = monitor.execute(
+            """SELECT old_status, new_status, actor, scope_mode, verified_matter_id, reason_code
+               FROM weaverlaw.audit_event WHERE run_id = %s ORDER BY audit_id""",
+            (race_run_id,),
+        ).fetchall()
+        assert audit_rows == [
+            (None, 'RECEIVED', 'wl_intake', 'INTAKE_RESTRICTED', None, 'ACCEPTED'),
+            ('RECEIVED', 'QUARANTINED', 'wl_resolver', 'INTAKE_RESTRICTED', None, 'MATTER_INELIGIBLE'),
+        ]
 
 
 def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
@@ -518,13 +759,13 @@ def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
         with pooled_conn.transaction():
             pooled_conn.execute('SET LOCAL ROLE wl_worker')
             pooled_conn.execute(
-                "SELECT set_config('app.verified_firm_id', %s, true), "
-                "set_config('app.verified_matter_id', %s, true)",
+                "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                "pg_catalog.set_config('app.verified_matter_id', %s, true)",
                 (str(FIRM_A), str(MATTER_A)),
             )
             in_tx_user, in_tx_firm, in_tx_matter = pooled_conn.execute(
-                "SELECT current_user, current_setting('app.verified_firm_id', true), "
-                "current_setting('app.verified_matter_id', true)"
+                "SELECT current_user, pg_catalog.current_setting('app.verified_firm_id', true), "
+                "pg_catalog.current_setting('app.verified_matter_id', true)"
             ).fetchone()
             assert in_tx_user == 'wl_worker'
             assert in_tx_firm == str(FIRM_A)
@@ -540,8 +781,8 @@ def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
         # Next transaction on the EXACT SAME physical connection must have clean role & empty GUCs
         with pooled_conn.transaction():
             after_user, after_firm, after_matter = pooled_conn.execute(
-                "SELECT current_user, coalesce(current_setting('app.verified_firm_id', true), ''), "
-                "coalesce(current_setting('app.verified_matter_id', true), '')"
+                "SELECT current_user, coalesce(pg_catalog.current_setting('app.verified_firm_id', true), ''), "
+                "coalesce(pg_catalog.current_setting('app.verified_matter_id', true), '')"
             ).fetchone()
             assert after_user == base_user
             assert after_firm == ''

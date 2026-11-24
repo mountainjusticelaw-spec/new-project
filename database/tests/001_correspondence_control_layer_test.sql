@@ -66,7 +66,7 @@ SELECT set_config('app.verified_matter_id','',true);
 DO $$ BEGIN IF EXISTS(SELECT 1 FROM weaverlaw.workflow_step) OR EXISTS(SELECT 1 FROM weaverlaw.workflow_run) THEN RAISE EXCEPTION 'missing scope allowed reads'; END IF; END $$;
 RESET ROLE;
 -- Force the audit insert to fail; the enclosing transaction must roll back the update.
-REVOKE INSERT ON weaverlaw.audit_event FROM wl_worker;
+REVOKE INSERT ON weaverlaw.audit_event FROM wl_audit_writer;
 SET LOCAL ROLE wl_worker;
 SELECT set_config('app.verified_matter_id','00000000-0000-0000-0000-000000000003',true);
 DO $$ BEGIN

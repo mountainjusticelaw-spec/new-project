@@ -15,9 +15,12 @@ def _idle(conn):
 
 
 def _scope(cur, firm_id, matter_id=None):
-    cur.execute("SELECT set_config('app.verified_firm_id', %s, true), "
-                "set_config('app.verified_matter_id', %s, true)",
-                (str(firm_id), str(matter_id) if matter_id else ''))
+    cur.execute("SET LOCAL search_path = pg_catalog")
+    cur.execute(
+        "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+        "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+        (str(firm_id), str(matter_id) if matter_id else ''),
+    )
 
 
 def _cas(cur, firm_id, run_id, expected, target, actor, matter_id, reason):
@@ -75,7 +78,9 @@ def resolve_run(conn, *, firm_id, run_id, trusted_signals):
         with conn.cursor() as cur:
             _scope(cur, firm_id)
             cur.execute("""SELECT firm_id,verified_matter_id,clio_matter_id,eligibility
-                FROM weaverlaw.matter_mapping WHERE firm_id=%s AND clio_matter_id::text=ANY(%s::text[])""",
+                FROM weaverlaw.matter_mapping
+                WHERE firm_id=%s AND clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])
+                FOR SHARE""",
                 (firm_id,signals))
             matter, reason = Resolver(Mapping(*row) for row in cur.fetchall()).resolve(firm_id,signals)
             target = State.VALIDATED if matter else State.QUARANTINED

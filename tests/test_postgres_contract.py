@@ -27,7 +27,7 @@ class FakeConnection:
     @contextmanager
     def cursor(self):
         yield self
-    def execute(self, sql, params):
+    def execute(self, sql, params=None):
         self.commands.append((sql,params))
     def fetchone(self):
         if isinstance(self.returned, list):
@@ -63,6 +63,8 @@ def move(conn, expected=State.VALIDATED, target=State.RUNNING, actor=Actor.COORD
 def test_conditional_update_uses_status_and_scope():
     conn = FakeConnection((UUID(int=3),))
     move(conn)
+    assert conn.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
+    assert 'pg_catalog.set_config' in conn.commands[1][0]
     sql, args = conn.commands[-1]
     assert 'WHERE run_id=%s AND firm_id=%s AND status=%s' in sql
     assert 'verified_matter_id IS NOT DISTINCT FROM %s' in sql
@@ -100,12 +102,13 @@ def test_receive_new_replay_and_firm_mismatch():
     conn_new = FakeConnection(returned=[(UUID(int=11),)])
     run_id, created = receive(conn_new, env, trusted_firm_id=UUID(int=1))
     assert created is True and run_id is not None and conn_new.commits == 1
-    assert len(conn_new.commands) == 4  # scope + inbox + run + outbox
+    assert conn_new.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
+    assert len(conn_new.commands) == 5  # search_path + scope + inbox + run + outbox
 
     conn_dup = FakeConnection(returned=[None])
     dup_run_id, dup_created = receive(conn_dup, env, trusted_firm_id=UUID(int=1))
     assert dup_run_id is None and dup_created is False and conn_dup.commits == 1
-    assert len(conn_dup.commands) == 2  # scope + inbox conflict only
+    assert len(conn_dup.commands) == 3  # search_path + scope + inbox conflict only
 
 
 def test_resolve_run_promotes_or_quarantines():
@@ -118,7 +121,9 @@ def test_resolve_run_promotes_or_quarantines():
         conn_ok, firm_id=firm, run_id=run_id, trusted_signals=['clio-001'],
     )
     assert (target, resolved_matter, reason) == (State.VALIDATED, matter, 'MATTER_VERIFIED')
-    assert 'clio_matter_id::text=ANY(%s::text[])' in conn_ok.commands[1][0]
+    assert conn_ok.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
+    assert 'clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])' in conn_ok.commands[2][0]
+    assert 'FOR SHARE' in conn_ok.commands[2][0]
     assert conn_ok.commits == 1
 
     conn_quarantine = FakeConnection(returned=(run_id,), rows=[])
