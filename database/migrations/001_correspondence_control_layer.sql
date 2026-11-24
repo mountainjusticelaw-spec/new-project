@@ -17,10 +17,10 @@ CREATE TYPE weaverlaw.run_status AS ENUM ('RECEIVED','VALIDATED','RUNNING','REVI
 CREATE DOMAIN weaverlaw.hex_digest AS text CHECK (VALUE ~ '^[0-9a-f]{64}$');
 CREATE DOMAIN weaverlaw.opaque_id AS text CHECK (VALUE ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$');
 CREATE FUNCTION weaverlaw.context_firm() RETURNS uuid LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
- SELECT pg_catalog.nullif(pg_catalog.current_setting('app.verified_firm_id',true),'')::pg_catalog.uuid
+ SELECT NULLIF(pg_catalog.current_setting('app.verified_firm_id',true),'')::pg_catalog.uuid
 $$;
 CREATE FUNCTION weaverlaw.context_matter() RETURNS uuid LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
- SELECT pg_catalog.nullif(pg_catalog.current_setting('app.verified_matter_id',true),'')::pg_catalog.uuid
+ SELECT NULLIF(pg_catalog.current_setting('app.verified_matter_id',true),'')::pg_catalog.uuid
 $$;
 CREATE FUNCTION weaverlaw.scope_valid(mode weaverlaw.scope_mode, matter uuid) RETURNS boolean LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$
  SELECT (mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode AND matter IS NULL) OR (mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND matter IS NOT NULL)
@@ -193,7 +193,7 @@ CREATE TRIGGER run_edge BEFORE UPDATE ON weaverlaw.workflow_run FOR EACH ROW EXE
 -- Audit write is isolated to SECURITY DEFINER wl_audit_writer in the same transaction; failure aborts the state mutation.
 CREATE FUNCTION weaverlaw.audit_run_edge() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
- v_actor text := COALESCE(pg_catalog.nullif(pg_catalog.nullif(pg_catalog.current_setting('role',true),''),'none'),session_user);
+ v_actor text := COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user);
 BEGIN
  IF TG_RELID <> 'weaverlaw.workflow_run'::pg_catalog.regclass OR v_actor = 'wl_audit_writer' THEN
   RAISE EXCEPTION 'unauthorized audit trigger source' USING ERRCODE='42501';
