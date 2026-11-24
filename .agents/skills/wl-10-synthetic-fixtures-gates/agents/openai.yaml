@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-10 Synthetic fixtures and gates"
+  short_description: "Run deterministic unit and real disposable PostgreSQL release"
+  default_prompt: "Use $wl-10-synthetic-fixtures-gates to run and report the local synthetic control-layer verification gate."

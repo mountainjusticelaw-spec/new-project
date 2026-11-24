@@ -1,6 +1,6 @@
 # Proposed architecture — v0.1
 
-Status: design baseline, not deployed. Final service selection, versions, availability, quotas, costs and data terms must be confirmed before provisioning.
+Status: proposed deployment architecture, not deployed. The future Google ADK + Gemini + Cloud SQL for PostgreSQL stack is locked by [ADR-002](docs/DECISIONS.md). PR1 implements only local deterministic controls and synthetic tests; versions, availability, quotas, costs and data terms must be confirmed before provisioning.
 
 ## Goals
 An incoming event or human request becomes a durable, matter-scoped job; deterministic orchestration invokes bounded specialists; source-linked findings and proposed actions reach an attorney review queue. Only an authorized executor can perform an approved external effect. The agent never bypasses policy.
@@ -26,7 +26,7 @@ flowchart TD
 | --- | --- | --- |
 | UI | Next.js / TypeScript on Cloud Run | Authenticated matter, run and approval views |
 | API / worker | Python on Cloud Run | Validate events, authorize access, coordinate jobs |
-| Agent runtime | Google ADK + Gemini; managed runtime optional later | Bounded analysis and delegation; no independent authority |
+| Agent runtime | Google ADK + Gemini, future activation only | Bounded analysis and delegation; no independent authority |
 | Events | Pub/Sub; Eventarc when appropriate | At-least-once delivery assumed; no ordering assumption |
 | Schedules | Cloud Scheduler | Authorized recurring jobs and reconciliation |
 | State | Cloud SQL PostgreSQL | Transactional event inbox, run state, approvals, effects, audit |

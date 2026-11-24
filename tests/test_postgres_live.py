@@ -24,14 +24,16 @@ from uuid import UUID, uuid4
 import pytest
 
 from services.correspondence.core import Actor, Denied, Envelope, State
-from services.correspondence.postgres import receive, resolve_run, transition
+from services.correspondence.postgres import (
+    receive, resolve_run, revalidate_matter_eligibility, transition,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_SQL = REPO_ROOT / 'database' / 'migrations' / '001_correspondence_control_layer.sql'
 TEST_SQL = REPO_ROOT / 'database' / 'tests' / '001_correspondence_control_layer_test.sql'
 
 ROLES = ('wl_intake', 'wl_resolver', 'wl_worker', 'wl_reviewer', 'wl_attorney', 'wl_executor')
-ALL_RESTRICTED_ROLES = (*ROLES, 'wl_audit_writer')
+ALL_RESTRICTED_ROLES = (*ROLES, 'wl_audit_writer', 'wl_scope_guard')
 ALL_TABLES = (
     'matter_mapping', 'event_inbox', 'workflow_run', 'outbox', 'audit_event',
     'workflow_step', 'agent_run', 'source_reference', 'work_product',
@@ -253,9 +255,9 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
         _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
         _connect(seeded_cluster) as admin,
     ):
-        run_a, ok_a = receive(intake_conn, _make_envelope(source_ref='synthetic-rls-a'), trusted_firm_id=FIRM_A)
-        run_b, ok_b = receive(intake_conn, _make_envelope(source_ref='synthetic-rls-b'), trusted_firm_id=FIRM_A)
-        run_q, ok_q = receive(intake_conn, _make_envelope(source_ref='synthetic-rls-q'), trusted_firm_id=FIRM_A)
+        run_a, ok_a = receive(intake_conn, _make_envelope(source_ref='synthetic-rls-a'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'])
+        run_b, ok_b = receive(intake_conn, _make_envelope(source_ref='synthetic-rls-b'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-b'])
+        run_q, ok_q = receive(intake_conn, _make_envelope(source_ref='synthetic-rls-q'), trusted_firm_id=FIRM_A, trusted_signals=['unmapped-signal!'])
         assert ok_a and ok_b and ok_q
 
         assert resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_a, trusted_signals=['clio-live-a']) == (
@@ -292,7 +294,7 @@ def test_all_roles_and_rls_forced_and_cross_matter_isolated(seeded_cluster):
                 assert matters == [(MATTER_A,)], f'{role} leaked rows on {table}: {matters}'
 
     # wl_intake and wl_resolver cannot read Tier B tables; wl_executor has zero table grants in PR1
-    for denied_role in ('wl_intake', 'wl_resolver', 'wl_executor'):
+    for denied_role in ('wl_intake', 'wl_resolver', 'wl_executor', 'wl_audit_writer', 'wl_scope_guard'):
         with _connect(seeded_cluster, denied_role) as conn:
             for table in TIER_B_TABLES:
                 with pytest.raises(psycopg.errors.InsufficientPrivilege), conn.transaction():
@@ -331,7 +333,7 @@ def test_scope_promotion_and_audit_atomicity_immutability_and_rollback(seeded_cl
         _connect(seeded_cluster) as admin,
     ):
         run_id, created = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-audit-chain'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-audit-chain'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'],
         )
         assert created is True
         target, matter, reason = resolve_run(
@@ -401,7 +403,7 @@ def test_scope_promotion_and_audit_atomicity_immutability_and_rollback(seeded_cl
 
         # Prove simulated audit-insert failure (revoking wl_audit_writer INSERT) rolls back workflow_run transition
         run_rb, _ = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-audit-rollback'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-audit-rollback'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'],
         )
         resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_rb, trusted_signals=['clio-live-a'])
         admin.execute('REVOKE INSERT ON weaverlaw.audit_event FROM wl_audit_writer')
@@ -429,7 +431,7 @@ def test_pg_temp_trigger_cannot_forge_audit_event(seeded_cluster):
         _connect(seeded_cluster) as admin,
     ):
         run_id, created = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-temp-trig-001'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-temp-trig-001'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'],
         )
         assert created is True and run_id is not None
         assert resolve_run(
@@ -493,7 +495,7 @@ def test_temp_table_shadowing_cannot_hijack_mapping_or_audit(seeded_cluster):
         _connect(seeded_cluster) as admin,
     ):
         shadow_run_id, created = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-temp-shadow-001'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-temp-shadow-001'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-closed'],
         )
         assert created is True and shadow_run_id is not None
 
@@ -543,7 +545,7 @@ def test_temp_table_shadowing_cannot_hijack_mapping_or_audit(seeded_cluster):
 
         # Also verify transition() ignores pg_temp.workflow_run and pg_temp.audit_event
         valid_run_id, _ = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-temp-shadow-002'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-temp-shadow-002'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'],
         )
         assert resolve_run(
             resolver_conn, firm_id=FIRM_A, run_id=valid_run_id, trusted_signals=['clio-live-a'],
@@ -573,7 +575,7 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
         env = _make_envelope(source_ref='synthetic-concurrent-dedup-001', event_id=uuid4())
         with _connect(seeded_cluster, 'wl_intake') as conn:
             barrier.wait(timeout=10)
-            return receive(conn, env, trusted_firm_id=FIRM_A)
+            return receive(conn, env, trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'])
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(submit_duplicate, range(workers)))
@@ -581,7 +583,7 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
     winners = [run_id for run_id, created in results if created]
     losers = [run_id for run_id, created in results if not created]
     assert len(winners) == 1 and winners[0] is not None
-    assert losers == [None] * (workers - 1)
+    assert losers == [winners[0]] * (workers - 1)
     dedup_run_id = winners[0]
 
     with _connect(seeded_cluster) as admin:
@@ -632,9 +634,9 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
         _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
     ):
         revoked_run, _ = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-revoked-map-001'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-revoked-map-001'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-closed'],
         )
-        with pytest.raises(psycopg.errors.RaiseException), resolver_conn.transaction():
+        with pytest.raises(psycopg.errors.CheckViolation, match='resolution differs from immutable inbox evidence'), resolver_conn.transaction():
             resolver_conn.execute(
                 "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
                 "pg_catalog.set_config('app.verified_matter_id', %s, true)",
@@ -666,7 +668,7 @@ def test_concurrent_mapping_revocation_two_session_race(seeded_cluster):
         race_run_id, created = receive(
             intake_conn,
             _make_envelope(source_ref='synthetic-two-session-revoke-001'),
-            trusted_firm_id=FIRM_A,
+            trusted_firm_id=FIRM_A, trusted_signals=['clio-live-race'],
         )
         assert created is True and race_run_id is not None
 
@@ -745,7 +747,7 @@ def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
         _connect(seeded_cluster) as admin,
     ):
         pool_run_id, created = receive(
-            intake_conn, _make_envelope(source_ref='synthetic-pool-isolation-001'), trusted_firm_id=FIRM_A,
+            intake_conn, _make_envelope(source_ref='synthetic-pool-isolation-001'), trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'],
         )
         assert created is True and pool_run_id is not None
         assert resolve_run(
@@ -793,3 +795,374 @@ def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
             assert leaked_runs == 0
             for table in TIER_B_TABLES:
                 assert pooled_conn.execute(f'SELECT count(*) FROM weaverlaw.{table}').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('starting_status', [State.VALIDATED, State.RUNNING])
+def test_restricted_matter_after_validation_quarantines_before_forward_transition(seeded_cluster, starting_status):
+    matter_id = uuid4()
+    signal = f'clio-post-validation-{matter_id.hex}'
+    with (
+        _connect(seeded_cluster) as admin,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+        _connect(seeded_cluster, 'wl_worker') as worker_conn,
+        _connect(seeded_cluster, 'wl_reviewer') as reviewer_conn,
+    ):
+        admin.execute(
+            """INSERT INTO weaverlaw.matter_mapping
+               (firm_id, verified_matter_id, clio_matter_id, eligibility, mapping_version)
+               VALUES (%s, %s, %s, 'OPEN', 'v1')""",
+            (FIRM_A, matter_id, signal),
+        )
+        run_id, created = receive(
+            intake_conn, _make_envelope(source_ref=f'synthetic-post-validation-{matter_id.hex}'),
+            trusted_firm_id=FIRM_A, trusted_signals=[signal],
+        )
+        assert created is True
+        assert resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_id) == (
+            State.VALIDATED, matter_id, 'MATTER_VERIFIED',
+        )
+        if starting_status == State.RUNNING:
+            transition(
+                worker_conn, firm_id=FIRM_A, matter_id=matter_id, run_id=run_id,
+                expected=State.VALIDATED, target=State.RUNNING,
+                actor=Actor.COORDINATOR, reason='START',
+            )
+        original_evidence = admin.execute(
+            'SELECT resolution_evidence FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()[0]
+        # Preserve historical matter records while removing the run's active scope.
+        _seed_tier_b_bundle(admin, firm_id=FIRM_A, run_id=run_id, matter_id=matter_id, tag=matter_id.hex)
+        admin.execute(
+            "UPDATE weaverlaw.matter_mapping SET eligibility = 'RESTRICTED', mapping_version = 'v2' "
+            'WHERE firm_id = %s AND verified_matter_id = %s',
+            (FIRM_A, matter_id),
+        )
+        target = State.RUNNING if starting_status == State.VALIDATED else State.REVIEW_REQUIRED
+        conn = worker_conn if starting_status == State.VALIDATED else reviewer_conn
+        actor = Actor.COORDINATOR if starting_status == State.VALIDATED else Actor.INDEPENDENT_REVIEW
+        # RLS hides revoked scope before a direct SQL role can reach the edge trigger.
+        audit_before_direct = admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0]
+        with conn.transaction():
+            conn.execute(
+                "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+                (str(FIRM_A), str(matter_id)),
+            )
+            assert conn.execute(
+                'UPDATE weaverlaw.workflow_run SET status = %s, reason_code = %s WHERE run_id = %s',
+                (target.value, 'DIRECT_POST_REVOCATION', run_id),
+            ).rowcount == 0
+        assert admin.execute(
+            'SELECT status FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == starting_status.value
+        assert admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == audit_before_direct
+        with pytest.raises(Denied):
+            transition(
+                conn, firm_id=FIRM_A, matter_id=matter_id, run_id=run_id,
+                expected=starting_status, target=target, actor=actor,
+                reason='POST_REVOCATION_ATTEMPT', independently_checked=True,
+            )
+        row = admin.execute(
+            """SELECT status, scope_mode, verified_matter_id, reason_code, resolution_evidence
+               FROM weaverlaw.workflow_run WHERE run_id = %s""", (run_id,),
+        ).fetchone()
+        assert row == ('QUARANTINED', 'INTAKE_RESTRICTED', None, 'MATTER_INELIGIBLE', original_evidence)
+        audit = admin.execute(
+            'SELECT old_status, new_status, reason_code FROM weaverlaw.audit_event '
+            'WHERE run_id = %s ORDER BY audit_id DESC LIMIT 1', (run_id,),
+        ).fetchone()
+        assert audit == (starting_status.value, 'QUARANTINED', 'MATTER_INELIGIBLE')
+        assert admin.execute(
+            'SELECT count(*) FROM weaverlaw.workflow_step WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == 1
+        with worker_conn.transaction():
+            worker_conn.execute(
+                "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+                (str(FIRM_A), str(matter_id)),
+            )
+            for table in TIER_B_TABLES:
+                assert worker_conn.execute(
+                    f'SELECT count(*) FROM weaverlaw.{table} WHERE run_id = %s', (run_id,),
+                ).fetchone()[0] == 0
+        with pytest.raises(Denied):
+            transition(
+                worker_conn, firm_id=FIRM_A, matter_id=matter_id, run_id=run_id,
+                expected=State.VALIDATED, target=State.RUNNING,
+                actor=Actor.COORDINATOR, reason='RETRY_REVOKED',
+            )
+
+
+def test_resolution_uses_immutable_intake_evidence_and_rejects_mismatched_signals(seeded_cluster):
+    import psycopg.errors
+
+    envelope = _make_envelope(source_ref='synthetic-bound-resolution-evidence')
+    with (
+        _connect(seeded_cluster) as admin,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+    ):
+        run_id, created = receive(
+            intake_conn, envelope, trusted_firm_id=FIRM_A,
+            trusted_signals=['clio-live-a'], payload_sha256='a' * 64,
+        )
+        assert created is True
+        before = admin.execute(
+            'SELECT status, resolution_evidence FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()
+        for unbound in (['clio-live-b'], [], ['clio-live-a', 'unbound-signal']):
+            with pytest.raises(Denied):
+                resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_id, trusted_signals=unbound)
+            assert admin.execute(
+                'SELECT status, resolution_evidence FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+            ).fetchone() == before
+        assert admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == 1
+        assert resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_id) == (
+            State.VALIDATED, MATTER_A, 'MATTER_VERIFIED',
+        )
+        inbox_id, evidence = admin.execute(
+            'SELECT inbox_id, resolution_evidence FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()
+        assert evidence['run_id'] == str(run_id)
+        assert evidence['inbox_id'] == str(inbox_id)
+        assert evidence['source_reference'] == envelope.source_ref
+        assert evidence['source_version'] == envelope.source_version
+        assert evidence['extracted_signals'] == ['clio-live-a']
+        assert evidence['matched_clio_ids'] == ['clio-live-a']
+        assert evidence['mapping_version'] == {'clio-live-a': 'v1'}
+        assert evidence['decision'] == 'VALIDATED'
+        assert evidence['reason_code'] == 'MATTER_VERIFIED'
+        inbox_row = admin.execute(
+            'SELECT matter_signals, envelope_sha256, payload_sha256 '
+            'FROM weaverlaw.event_inbox WHERE inbox_id = %s', (inbox_id,),
+        ).fetchone()
+        assert inbox_row[0] == ['clio-live-a']
+        assert len(inbox_row[1]) == 64 and inbox_row[2] == 'a' * 64
+        with pytest.raises(psycopg.errors.CheckViolation, match='(?i)immutable'), admin.transaction():
+            admin.execute(
+                "UPDATE weaverlaw.event_inbox SET matter_signals = %s::jsonb WHERE inbox_id = %s",
+                (json.dumps(['clio-live-b']), inbox_id),
+            )
+        with pytest.raises(psycopg.errors.CheckViolation, match='(?i)immutable'), admin.transaction():
+            admin.execute(
+                "UPDATE weaverlaw.workflow_run SET resolution_evidence = '{}'::jsonb WHERE run_id = %s", (run_id,),
+            )
+        assert admin.execute(
+            'SELECT resolution_evidence FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == evidence
+        no_evidence_run, _ = receive(
+            intake_conn, _make_envelope(source_ref='synthetic-empty-bound-resolution'),
+            trusted_firm_id=FIRM_A,
+        )
+        with pytest.raises(Denied):
+            resolve_run(resolver_conn, firm_id=FIRM_A, run_id=no_evidence_run, trusted_signals=['clio-live-a'])
+        assert resolve_run(resolver_conn, firm_id=FIRM_A, run_id=no_evidence_run) == (
+            State.QUARANTINED, None, 'UNMAPPED_MATTER_SIGNAL',
+        )
+
+
+@pytest.mark.parametrize('conflict', ['signals', 'payload'])
+def test_contradictory_replay_quarantines_one_bound_run_and_records_anomaly(seeded_cluster, conflict):
+    envelope = _make_envelope(source_ref=f'synthetic-conflicting-replay-{conflict}')
+    with (
+        _connect(seeded_cluster) as admin,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+    ):
+        run_id, created = receive(
+            intake_conn, envelope, trusted_firm_id=FIRM_A,
+            trusted_signals=['clio-live-a'], payload_sha256='a' * 64,
+        )
+        assert created is True
+        assert resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_id) == (
+            State.VALIDATED, MATTER_A, 'MATTER_VERIFIED',
+        )
+        before = admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0]
+        duplicate_envelope = _make_envelope(source_ref=envelope.source_ref)
+        assert receive(
+            intake_conn, duplicate_envelope, trusted_firm_id=FIRM_A,
+            trusted_signals=['clio-live-a', 'clio-live-a'], payload_sha256='a' * 64,
+        ) == (run_id, False)
+        assert admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == before
+        original_evidence = admin.execute(
+            'SELECT resolution_evidence FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()[0]
+        assert receive(
+            intake_conn, duplicate_envelope, trusted_firm_id=FIRM_A,
+            trusted_signals=['clio-live-b'] if conflict == 'signals' else ['clio-live-a'],
+            payload_sha256='b' * 64 if conflict == 'payload' else 'a' * 64,
+        ) == (run_id, False)
+        assert admin.execute(
+            'SELECT status, scope_mode, verified_matter_id, reason_code, resolution_evidence '
+            'FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone() == ('QUARANTINED', 'INTAKE_RESTRICTED', None, 'CONFLICTING_REPLAY_SIGNALS', original_evidence)
+        assert admin.execute(
+            """SELECT count(*) FROM weaverlaw.workflow_run r JOIN weaverlaw.event_inbox i
+               ON i.inbox_id = r.inbox_id WHERE i.source = %s AND i.dedup_key = %s""",
+            (envelope.source, envelope.dedup_key),
+        ).fetchone()[0] == 1
+        assert admin.execute(
+            "SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s AND reason_code = 'CONFLICTING_REPLAY_SIGNALS'",
+            (run_id,),
+        ).fetchone()[0] >= 1
+        assert admin.execute(
+            'SELECT count(*) FROM weaverlaw.outbox WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == 1
+
+
+def test_contradictory_replay_preserves_terminal_run_and_records_anomaly(seeded_cluster):
+    envelope = _make_envelope(source_ref='synthetic-terminal-conflicting-replay')
+    with (
+        _connect(seeded_cluster) as admin,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+        _connect(seeded_cluster, 'wl_worker') as worker_conn,
+    ):
+        run_id, _ = receive(intake_conn, envelope, trusted_firm_id=FIRM_A, trusted_signals=['clio-live-a'])
+        resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_id)
+        transition(
+            worker_conn, firm_id=FIRM_A, matter_id=MATTER_A, run_id=run_id,
+            expected=State.VALIDATED, target=State.CANCELLED, actor=Actor.COORDINATOR, reason='CANCEL',
+        )
+        before = admin.execute(
+            'SELECT status, scope_mode, verified_matter_id, reason_code, resolution_evidence '
+            'FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()
+        audit_count = admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0]
+        assert revalidate_matter_eligibility(
+            worker_conn, firm_id=FIRM_A, matter_id=MATTER_A, run_id=run_id,
+        ) is False
+        assert admin.execute(
+            'SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s', (run_id,),
+        ).fetchone()[0] == audit_count
+        assert receive(
+            intake_conn, envelope, trusted_firm_id=FIRM_A, trusted_signals=['clio-live-b'],
+        ) == (run_id, False)
+        assert admin.execute(
+            'SELECT status, scope_mode, verified_matter_id, reason_code, resolution_evidence '
+            'FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone() == before
+        assert admin.execute(
+            "SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s AND reason_code = 'CONFLICTING_REPLAY_SIGNALS'",
+            (run_id,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('dispatch', ['adapter', 'direct_sql'])
+def test_ongoing_transition_serializes_with_two_session_mapping_revocation(seeded_cluster, dispatch):
+    import psycopg.errors
+
+    matter_id = uuid4()
+    signal = f'clio-ongoing-race-{matter_id.hex}'
+    with (
+        _connect(seeded_cluster) as admin_seed,
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+    ):
+        admin_seed.execute(
+            """INSERT INTO weaverlaw.matter_mapping
+               (firm_id, verified_matter_id, clio_matter_id, eligibility, mapping_version)
+               VALUES (%s, %s, %s, 'OPEN', 'v1')""", (FIRM_A, matter_id, signal),
+        )
+        run_id, _ = receive(
+            intake_conn, _make_envelope(source_ref=f'synthetic-ongoing-race-{matter_id.hex}'),
+            trusted_firm_id=FIRM_A, trusted_signals=[signal],
+        )
+        assert resolve_run(resolver_conn, firm_id=FIRM_A, run_id=run_id) == (
+            State.VALIDATED, matter_id, 'MATTER_VERIFIED',
+        )
+
+    barrier = threading.Barrier(2)
+    with (
+        _connect(seeded_cluster) as revoker,
+        _connect(seeded_cluster, 'wl_worker') as worker,
+        _connect(seeded_cluster) as monitor,
+    ):
+        worker_pid = worker.info.backend_pid
+
+        def attempt_forward_transition():
+            barrier.wait(timeout=10)
+            if dispatch == 'adapter':
+                try:
+                    transition(
+                        worker, firm_id=FIRM_A, matter_id=matter_id, run_id=run_id,
+                        expected=State.VALIDATED, target=State.RUNNING,
+                        actor=Actor.COORDINATOR, reason='RACE_START',
+                    )
+                except Denied:
+                    return 'DENIED'
+                return 'MOVED'
+            try:
+                with worker.transaction():
+                    worker.execute(
+                        "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
+                        "pg_catalog.set_config('app.verified_matter_id', %s, true)",
+                        (str(FIRM_A), str(matter_id)),
+                    )
+                    changed = worker.execute(
+                        "UPDATE weaverlaw.workflow_run SET status = 'RUNNING', reason_code = 'DIRECT_RACE_START' "
+                        "WHERE run_id = %s AND status = 'VALIDATED' RETURNING run_id", (run_id,),
+                    ).fetchone()
+                return 'NO_ROWS' if changed is None else 'MOVED'
+            except psycopg.errors.InsufficientPrivilege as err:
+                assert err.sqlstate == '42501'
+                return 'DENIED_SQL'
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with revoker.transaction():
+                revoker.execute(
+                    "UPDATE weaverlaw.matter_mapping SET eligibility = 'CLOSED', mapping_version = 'v2' "
+                    'WHERE firm_id = %s AND verified_matter_id = %s', (FIRM_A, matter_id),
+                )
+                future = pool.submit(attempt_forward_transition)
+                barrier.wait(timeout=10)
+                deadline = time.monotonic() + 5.0
+                blocked = False
+                while time.monotonic() < deadline:
+                    wait = monitor.execute(
+                        'SELECT wait_event_type FROM pg_catalog.pg_stat_activity WHERE pid = %s', (worker_pid,),
+                    ).fetchone()
+                    if wait and wait[0] == 'Lock':
+                        blocked = True
+                        break
+                    time.sleep(0.01)
+                assert blocked, 'ongoing transition did not wait for the concurrent mapping revocation'
+            outcome = future.result(timeout=10)
+
+        assert monitor.execute(
+            "SELECT count(*) FROM weaverlaw.audit_event WHERE run_id = %s AND new_status = 'RUNNING'", (run_id,),
+        ).fetchone()[0] == 0
+        row = monitor.execute(
+            'SELECT status, scope_mode, verified_matter_id, reason_code '
+            'FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+        ).fetchone()
+        if dispatch == 'adapter':
+            assert outcome == 'DENIED'
+            assert row == ('QUARANTINED', 'INTAKE_RESTRICTED', None, 'MATTER_INELIGIBLE')
+        else:
+            assert outcome in ('DENIED_SQL', 'NO_ROWS')
+            assert row == ('VALIDATED', 'MATTER_VERIFIED', matter_id, 'MATTER_VERIFIED')
+            assert revalidate_matter_eligibility(
+                worker, firm_id=FIRM_A, matter_id=matter_id, run_id=run_id,
+            ) is False
+            assert monitor.execute(
+                'SELECT status, scope_mode, verified_matter_id, reason_code '
+                'FROM weaverlaw.workflow_run WHERE run_id = %s', (run_id,),
+            ).fetchone() == ('QUARANTINED', 'INTAKE_RESTRICTED', None, 'MATTER_INELIGIBLE')
+        assert monitor.execute(
+            'SELECT old_status, new_status, reason_code FROM weaverlaw.audit_event '
+            'WHERE run_id = %s ORDER BY audit_id DESC LIMIT 1', (run_id,),
+        ).fetchone() == ('VALIDATED', 'QUARANTINED', 'MATTER_INELIGIBLE')

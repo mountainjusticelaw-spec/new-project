@@ -4,8 +4,10 @@ No connections, credentials or cloud calls are created here. A connection must b
 idle and dedicated to the named database role. Scope values come from the trusted
 server boundary, never an LLM or raw event. The database enforces role and RLS.
 """
+import json
 from uuid import uuid4
-from .core import Actor, Denied, Mapping, Resolver, State, check_edge
+from .core import (Actor, Denied, Envelope, Mapping, Resolver, State, canonical_signals,
+                   check_edge, intake_evidence)
 
 
 def _idle(conn):
@@ -37,14 +39,15 @@ def _cas(cur, firm_id, run_id, expected, target, actor, matter_id, reason):
         raise Denied('stale, missing or unauthorized run')
 
 
-def receive(conn, envelope, *, trusted_firm_id):
-    """wl_intake: inbox + received run + audit trigger + outbox commit together.
+def receive(conn, envelope, *, trusted_firm_id, trusted_signals=(), payload_sha256=None):
+    """Atomically bind immutable synthetic evidence and create one run/outbox.
 
-    Return (run_id, True) for new input; (None, False) for replay. Never expose
-    a verified run through the restricted intake path. The caller acks on return.
+    Replays return the originating run ID. Contradictions quarantine active work
+    through a narrow database function without granting intake matter access.
     """
     if envelope.firm_id != trusted_firm_id:
         raise Denied('firm mismatch')
+    evidence = intake_evidence(envelope, trusted_signals, payload_sha256)
     inbox_id, run_id = uuid4(), uuid4()
     _idle(conn)
     with conn.transaction():
@@ -52,15 +55,32 @@ def receive(conn, envelope, *, trusted_firm_id):
             _scope(cur, trusted_firm_id)
             cur.execute("""INSERT INTO weaverlaw.event_inbox
                 (inbox_id,firm_id,event_id,source,event_type,schema_version,occurred_at,received_at,
-                 correlation_id,source_ref,source_version,sensitivity,dedup_key)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 correlation_id,source_ref,source_version,sensitivity,dedup_key,
+                 matter_signals,envelope_sha256,payload_sha256,evidence_sha256)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::pg_catalog.jsonb,%s,%s,%s)
                 ON CONFLICT (source,dedup_key) DO NOTHING RETURNING inbox_id""",
                 (inbox_id, trusted_firm_id, envelope.event_id, envelope.source,
                  envelope.event_type,envelope.schema_version,envelope.occurred_at,
                  envelope.received_at,envelope.correlation_id,envelope.source_ref,
-                 envelope.source_version,envelope.sensitivity,envelope.dedup_key))
+                 envelope.source_version,envelope.sensitivity,envelope.dedup_key,
+                 json.dumps(evidence['matter_signals']), evidence['envelope_sha256'],
+                 evidence['payload_sha256'], evidence['evidence_sha256']))
             if cur.fetchone() is None:
-                return None, False
+                cur.execute("""SELECT inbox_id FROM weaverlaw.event_inbox
+                    WHERE firm_id=%s AND source=%s AND dedup_key=%s""",
+                    (trusted_firm_id, envelope.source, envelope.dedup_key))
+                original = cur.fetchone()
+                if original is None:
+                    raise Denied('missing or unauthorized intake evidence')
+                cur.execute("""SELECT weaverlaw.check_replay(
+                    %s,%s,%s::pg_catalog.jsonb,%s::pg_catalog.text,
+                    %s::pg_catalog.text,%s::pg_catalog.text)""",
+                    (trusted_firm_id, original[0], json.dumps(evidence['matter_signals']),
+                     evidence['envelope_sha256'], evidence['payload_sha256'], evidence['evidence_sha256']))
+                existing = cur.fetchone()
+                if existing is None or existing[0] is None:
+                    raise Denied('missing or unauthorized replay run')
+                return existing[0], False
             cur.execute("""INSERT INTO weaverlaw.workflow_run
                 (run_id,firm_id,inbox_id) VALUES (%s,%s,%s)""", (run_id,trusted_firm_id,inbox_id))
             cur.execute("""INSERT INTO weaverlaw.outbox
@@ -70,37 +90,87 @@ def receive(conn, envelope, *, trusted_firm_id):
     return run_id, True
 
 
-def resolve_run(conn, *, firm_id, run_id, trusted_signals):
-    """wl_resolver: trusted synthetic signal lookup only; no Tier B access."""
-    signals = list(dict.fromkeys(trusted_signals))
+ingest_event = receive
+
+
+def resolve_run(conn, *, firm_id, run_id, trusted_signals=None):
+    """Resolve only immutable evidence from the run's originating inbox.
+
+    Optional caller signals are a consistency assertion, never an alternate
+    source of authority. PostgreSQL independently derives the resolution audit.
+    """
+    supplied = None if trusted_signals is None else canonical_signals(trusted_signals)
     _idle(conn)
     with conn.transaction():
         with conn.cursor() as cur:
             _scope(cur, firm_id)
-            cur.execute("""SELECT firm_id,verified_matter_id,clio_matter_id,eligibility
+            cur.execute("""SELECT pg_catalog.to_jsonb(e)
+                FROM weaverlaw.event_inbox e JOIN weaverlaw.workflow_run r
+                  ON r.inbox_id=e.inbox_id AND r.firm_id=e.firm_id
+                WHERE r.firm_id=%s AND r.run_id=%s AND r.status='RECEIVED'""",
+                (firm_id, run_id))
+            row = cur.fetchone()
+            if row is None:
+                raise Denied('missing or unauthorized intake evidence')
+            bound = row[0]
+            try:
+                envelope = Envelope.model_validate({key: bound[key] for key in Envelope.model_fields})
+                evidence = intake_evidence(envelope, bound['matter_signals'], bound['payload_sha256'])
+            except (KeyError, TypeError, ValueError) as err:
+                raise Denied('invalid intake evidence') from err
+            if any(evidence[key] != bound[key] for key in ('envelope_sha256','payload_sha256','evidence_sha256')):
+                raise Denied('intake evidence digest mismatch')
+            signals = canonical_signals(bound['matter_signals'])
+            if list(signals) != bound['matter_signals'] or (supplied is not None and supplied != signals):
+                raise Denied('signals do not match bound intake evidence')
+            cur.execute("""SELECT firm_id,verified_matter_id,clio_matter_id,eligibility,mapping_version
                 FROM weaverlaw.matter_mapping
                 WHERE firm_id=%s AND clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])
-                FOR SHARE""",
-                (firm_id,signals))
-            matter, reason = Resolver(Mapping(*row) for row in cur.fetchall()).resolve(firm_id,signals)
+                FOR SHARE""", (firm_id,list(signals)))
+            matter, reason = Resolver(Mapping(*mapping) for mapping in cur.fetchall()).resolve(firm_id,signals)
             target = State.VALIDATED if matter else State.QUARANTINED
             _scope(cur,firm_id,matter)
             _cas(cur,firm_id,run_id,State.RECEIVED,target,Actor.RESOLVER,matter,reason)
     return target, matter, reason
 
 
-def transition(conn, *, firm_id, matter_id, run_id, expected, target, actor, reason, independently_checked=False):
-    """Internal service dispatch only; never expose actor or scope as client input.
+def _revalidate(cur, firm_id, run_id, matter_id):
+    cur.execute('SELECT weaverlaw.revalidate_run(%s,%s,%s)', (firm_id,run_id,matter_id))
+    result = cur.fetchone()
+    if result is None:
+        raise Denied('missing or unauthorized run')
+    return result[0] is True
 
-    Independent-review calls require prior verified review evidence by the trusted
-    review service. Its actual verifier is deferred. Approval/effects stay disabled.
-    """
-    if target == State.REVIEW_REQUIRED and independently_checked is not True:
-        raise Denied('independent review required')
-    if expected == State.RECEIVED or actor == Actor.RESOLVER or matter_id is None:
-        raise Denied('use dedicated resolution path')
+
+def revalidate_matter_eligibility(conn, *, firm_id, matter_id, run_id):
+    """Commit a revoked-scope quarantine and return whether work may continue."""
+    if matter_id is None:
+        raise Denied('verified scope required')
     _idle(conn)
     with conn.transaction():
         with conn.cursor() as cur:
             _scope(cur,firm_id,matter_id)
-            _cas(cur,firm_id,run_id,expected,target,actor,matter_id,reason)
+            eligible = _revalidate(cur,firm_id,run_id,matter_id)
+    return eligible
+
+
+def transition(conn, *, firm_id, matter_id, run_id, expected, target, actor, reason, independently_checked=False):
+    """Trusted role dispatch with continuous eligibility and atomic CAS/audit."""
+    if target == State.REVIEW_REQUIRED and independently_checked is not True:
+        raise Denied('independent review required')
+    if expected == State.RECEIVED or actor == Actor.RESOLVER or matter_id is None:
+        raise Denied('use dedicated resolution path')
+    check_edge(expected,target,actor,matter_id,reason)
+    _idle(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            _scope(cur,firm_id,matter_id)
+            eligible = _revalidate(cur,firm_id,run_id,matter_id)
+            if eligible:
+                _cas(cur,firm_id,run_id,expected,target,actor,matter_id,reason)
+    # Denial must not roll back the durable quarantine recorded above.
+    if not eligible:
+        raise Denied('matter no longer eligible; run quarantined')
+
+
+transition_run = transition

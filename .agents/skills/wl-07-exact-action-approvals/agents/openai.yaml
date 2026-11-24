@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-07 Exact-action approvals"
+  short_description: "Bind local simulated effects to immutable accepted approvals"
+  default_prompt: "Use $wl-07-exact-action-approvals to check exact-action approval binding and simulated execution denial paths."

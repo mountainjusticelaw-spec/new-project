@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-06 Independent review"
+  short_description: "Keep evidence review separate from coordination and preserve"
+  default_prompt: "Use $wl-06-independent-review to inspect the independent review gate and its evidence requirements."

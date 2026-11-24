@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from uuid import UUID
 import pytest
-from services.correspondence.core import Actor, Denied, Envelope, State
+from services.correspondence.core import Actor, Denied, Envelope, State, intake_evidence
 from services.correspondence.postgres import receive, resolve_run, transition
 
 
@@ -55,13 +55,21 @@ def sample_envelope(firm_id=UUID(int=1)):
     )
 
 
+def bound_envelope(signals):
+    envelope = sample_envelope()
+    bound = envelope.model_dump(mode='json', exclude={'dedup_key'})
+    bound.update(intake_evidence(envelope, signals))
+    bound['matter_signals'] = list(bound['matter_signals'])
+    return bound
+
+
 def move(conn, expected=State.VALIDATED, target=State.RUNNING, actor=Actor.COORDINATOR):
     return transition(conn,firm_id=UUID(int=1),matter_id=UUID(int=2),run_id=UUID(int=3),
                       expected=expected,target=target,actor=actor,reason='START')
 
 
 def test_conditional_update_uses_status_and_scope():
-    conn = FakeConnection((UUID(int=3),))
+    conn = FakeConnection([(True,), (UUID(int=3),)])
     move(conn)
     assert conn.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
     assert 'pg_catalog.set_config' in conn.commands[1][0]
@@ -73,7 +81,7 @@ def test_conditional_update_uses_status_and_scope():
 
 
 def test_stale_update_rolls_back():
-    conn = FakeConnection(None)
+    conn = FakeConnection([(True,), None])
     with pytest.raises(Denied):
         move(conn)
     assert conn.rollbacks == 1 and conn.commits == 0
@@ -105,28 +113,28 @@ def test_receive_new_replay_and_firm_mismatch():
     assert conn_new.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
     assert len(conn_new.commands) == 5  # search_path + scope + inbox + run + outbox
 
-    conn_dup = FakeConnection(returned=[None])
+    conn_dup = FakeConnection(returned=[None, (UUID(int=11),), (run_id,)])
     dup_run_id, dup_created = receive(conn_dup, env, trusted_firm_id=UUID(int=1))
-    assert dup_run_id is None and dup_created is False and conn_dup.commits == 1
-    assert len(conn_dup.commands) == 3  # search_path + scope + inbox conflict only
+    assert dup_run_id == run_id and dup_created is False and conn_dup.commits == 1
+    assert len(conn_dup.commands) == 5  # scope + conflict + bound inbox + replay verification
 
 
 def test_resolve_run_promotes_or_quarantines():
     firm, matter, run_id = UUID(int=1), UUID(int=2), UUID(int=3)
     conn_ok = FakeConnection(
-        returned=(run_id,),
-        rows=[(firm, matter, 'clio-001', 'OPEN')],
+        returned=[(bound_envelope(['clio-001']),), (run_id,)],
+        rows=[(firm, matter, 'clio-001', 'OPEN', 'v1')],
     )
     target, resolved_matter, reason = resolve_run(
         conn_ok, firm_id=firm, run_id=run_id, trusted_signals=['clio-001'],
     )
     assert (target, resolved_matter, reason) == (State.VALIDATED, matter, 'MATTER_VERIFIED')
     assert conn_ok.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
-    assert 'clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])' in conn_ok.commands[2][0]
-    assert 'FOR SHARE' in conn_ok.commands[2][0]
+    assert 'clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])' in conn_ok.commands[3][0]
+    assert 'FOR SHARE' in conn_ok.commands[3][0]
     assert conn_ok.commits == 1
 
-    conn_quarantine = FakeConnection(returned=(run_id,), rows=[])
+    conn_quarantine = FakeConnection(returned=[(bound_envelope(['bad signal!']),), (run_id,)], rows=[])
     q_target, q_matter, q_reason = resolve_run(
         conn_quarantine, firm_id=firm, run_id=run_id, trusted_signals=['bad signal!'],
     )
@@ -149,3 +157,23 @@ def test_transition_guards_independent_review_and_resolution_path():
             actor=Actor.RESOLVER, reason='MATTER_VERIFIED',
         )
     assert not conn.commands and not conn.commits
+
+
+def test_revocation_quarantine_commits_before_transition_denial():
+    conn = FakeConnection([(False,)])
+    with pytest.raises(Denied, match='quarantined'):
+        move(conn)
+    assert conn.commits == 1 and conn.rollbacks == 0
+    assert not any(sql.startswith('UPDATE') for sql, _ in conn.commands)
+
+
+def test_resolve_rejects_mismatched_or_tampered_bound_evidence():
+    for tamper_digest in (False, True):
+        bound = bound_envelope(['clio-001'])
+        if tamper_digest:
+            bound['evidence_sha256'] = '0' * 64
+        conn = FakeConnection([(bound,)])
+        with pytest.raises(Denied):
+            resolve_run(conn, firm_id=UUID(int=1), run_id=UUID(int=3), trusted_signals=['clio-other'])
+        assert conn.rollbacks == 1 and not conn.commits
+        assert not any(sql.startswith('UPDATE') for sql, _ in conn.commands)

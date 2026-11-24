@@ -1,23 +1,94 @@
-# PR #1 - Synthetic incoming correspondence control layer (locked)
+# PR #1 — Synthetic incoming correspondence control layer (locked)
 
-Active skills: WL-01, WL-03, WL-05, WL-10. Governing source: owner-approved WEAVERLAW_SKILLS.md.docx (v0.1 aligned) and the four invariants approved in the project conversation. Existing architecture/governance documents remain controlling. This PR does not provision resources, enable billing or IAM, connect providers, send messages, alter official records or process client data.
+This contract covers the local deterministic slice and the F-01, F-02, and F-05 control repairs. [Architecture decisions](../../docs/DECISIONS.md) lock the future stack to Google ADK + Gemini + Cloud SQL for PostgreSQL. PR1 does not invoke ADK or Gemini, connect live provider adapters, provision resources, enable billing or IAM, deploy, send communications, alter official records, or process client data. [Governance](../../docs/GOVERNANCE.md), [security policy](../../SECURITY.md), and [AGENTS.md](../../AGENTS.md) retain their authority.
+
+The ten checked-in [workspace skills](../../skills/README.md) implement the repository contracts. They are repository-authored guidance, not a claimed verbatim reproduction of an unavailable owner document. WL-01 scopes the slice; WL-03, WL-05, WL-08, WL-09, and WL-10 cover evidence-bound identity, deterministic state, isolation, replay, and verification.
 
 ## Acceptance contract
-Submit one wholly fictional Georgia opposing-counsel correspondence. Derive the metadata-only envelope and dedup key; atomically accept the inbox/run/outbox; resolve exact trusted synthetic Clio signals; record the result with audit. A unique eligible match permits scoped processing; no match, conflicting/unmatched additional signals, closed or restricted mapping quarantines immediately with no Tier B writes or specialist invocation. Replays create no second run/outbox. Reject stale status and illegal transitions without state mutation. Only the local mock policy executor may simulate an approved effect. The database schema reserves execution states and approval/effect tables but grants no Tier B write or execution capability in PR1.
 
-## Envelope and identity
-Envelope uses Pydantic v2, UTC-aware timestamps, fixed schema version 1, synthetic.gmail / correspondence.received, firm UUID, event UUID, correlation UUID, synthetic opaque source_ref and version, synthetic classification. Reject unknown fields including user-supplied dedup key, body, instructions, or matter ID. Compute SHA-256 over canonical compact JSON array [schema_version, firm_id, source, event_type, source_ref, source_version]. Exclude event_id/correlation_id/receipt timestamp. New source version or firm produces a new key. Source identity is exact, case-sensitive; no fuzzy matching. The database unique(source,dedup_key) is the concurrency arbiter. Metadata syntax does not itself prove absence of PII; this adapter must receive only synthetic values. Source signals are a separately trusted adapter input, never supplied by an agent or trusted merely because found in a letter. Live verification/authentication and provider watch are deferred.
+Accept one wholly fictional Georgia opposing-counsel correspondence through the trusted synthetic boundary. Derive the metadata-only envelope, source-event dedup key, and immutable evidence digests. Atomically accept the inbox, received run, intake outbox, and initial audit. Resolve exact signals from the originating inbox; never replace its evidence with later caller claims. A unique eligible match permits scoped processing. No match, unmatched additional or conflicting signals, or a closed/restricted mapping quarantines without specialist invocation or Tier B writes.
 
-## SQL scope and transactions
-All 12 tables enable and force RLS. Four Tier A tables have scope_mode/nullable verified_matter_id consistency CHECKs; only run scope is promoted in this slice. Inbox, intake outbox and historical intake audit records stay restricted. Matter-specific records require NOT NULL verified_matter_id and both (run_id,verified_matter_id) and (run_id,firm_id,verified_matter_id) FKs. Dedicated NOLOGIN/NOSUPERUSER/NOBYPASSRLS roles: intake, resolver, worker, independent reviewer, attorney, executor. Roles have no memberships or production login configuration; only trusted services may obtain connections. Resolver reads firm-scoped mapping and intake metadata, never Tier B. Set transaction-local verified firm/matter GUCs from trusted server scope; no context denies reads. Custom GUCs do not authenticate the caller or defend against a compromised SQL role; real auth, database credential isolation and connection-pool security must be verified separately. No role is a table owner. Audit is append-only for app roles; UPDATE/DELETE/TRUNCATE prohibited. App roles can insert audit rows for trigger operation, so cryptographic tamper evidence and isolated trigger writer are future hardening, not guaranteed here.
+Replays retain exactly one inbox/run/outbox. Matching evidence returns the existing run idempotently. Contradictory evidence preserves the original inbox, quarantines a nonterminal run, and records an anomaly. Before matter-scoped progress, recheck current mapping eligibility; revocation withdraws active scope and blocks further work. Reject stale status, illegal actors/edges, mismatched resolution input, and unauthorized mutations without partial state changes. Revocation and contradictory replay are deliberate audited quarantine operations, not ordinary validation failures.
 
-`receive` writes inbox, run and outbox and audit in one transaction, duplicate returns (None, False). `resolve_run` reads only mapping rows and performs CAS. `transition` requires caller-owned idle psycopg 3 connection, scoped transaction and trusted actor. Atomic UPDATE WHERE run_id AND firm_id AND status=expected AND verified_matter_id matches; zero rows is Denied. SQL before-trigger independently rejects illegal role/state edges and scope changes; after-trigger persists audit in same transaction. Audit failure rolls back transition. Source/step/approval/effect tables are schema-only; no live writes. Real independent review evidence verifier, source freshness, mapping revocation race/concurrent updates, durable effect lease and authenticated attorney approvals require subsequent PRs. Mock executor only tests digest, expiry, versions, permissions, revocation, destination, kill switch and effect dedup in memory; not production authentication or durable execution. No network APIs.
+Only the local mock policy executor simulates an approved effect. SQL approval/execution edges remain disabled; the schema grants no application Tier B writes or production execution capability.
 
-## State edges
-RECEIVED -> VALIDATED or QUARANTINED (resolver). VALIDATED -> RUNNING (coordinator). RUNNING -> REVIEW_REQUIRED (independent review gate). REVIEW_REQUIRED -> REJECTED (attorney). VALIDATED/RUNNING -> FAILED; VALIDATED/RUNNING/REVIEW_REQUIRED/APPROVED -> CANCELLED (coordinator). Local simulation only: REVIEW_REQUIRED -> APPROVED -> EXECUTING -> COMPLETED or NEEDS_RECONCILIATION. Quarantine, failed, rejected, cancelled, completed and reconciliation are terminal for automatic processing. A reconciliation run cannot be blindly retried. SQL approval/execute edges disabled until persistent policy executor exists. No autonomous legal decisions or deadlines.
+## Envelope, evidence, and identity
 
-## Verification and review gate
-Local commands from repository root (Python >=3.11; Pydantic v2 and pytest installed): `python -m pytest -q`, `python -m compileall -q services tests`. For dependency setup use reviewed venv with `python -m pip install 'pydantic>=2.10,<3' 'pytest>=8,<10'`; optionally reviewed psycopg 3 for DB adapter. No SDK/provider credentials. Tests use a single-threaded memory fake and DBAPI fake; do not prove database behavior, concurrency or RLS. Actual migration and role tests are **UNRUN** here because PostgreSQL server/client is unavailable. Before merge, on an explicitly authorized fresh isolated local PostgreSQL cluster as local admin, create disposable database `weaverlaw_pr1_test`, run `psql -X -v ON_ERROR_STOP=1 -d weaverlaw_pr1_test -f database/migrations/001_correspondence_control_layer.sql` then `psql -X -v ON_ERROR_STOP=1 -d weaverlaw_pr1_test -f database/tests/001_correspondence_control_layer_test.sql`. Test script requires local disposable DB and rolls back fixture mutations. Run two-session duplicate/concurrent transition and mapping-revocation tests independently; verify grants, FORCE RLS and audit failure rollback. Do not run against an existing database. Roles are cluster-wide; migration is intentionally not idempotent; review Cloud SQL role bootstrap separately. No Cloud SQL migration has been applied. Rollback before merge: close draft branch/PR; if local testing is authorized, discard isolated test cluster only. Do not drop real data or roles. Require independent code/SQL review and owner acceptance before merge.
+`Envelope` uses Pydantic v2 with unknown fields forbidden, fixed schema version 1, `synthetic.gmail` / `correspondence.received`, nonzero firm/event/correlation UUIDs, UTC-aware ordered timestamps, synthetic opaque `source_ref` and `source_version`, and synthetic classification. Reject body, instructions, user-supplied dedup key, and asserted matter ID. Metadata syntax alone does not prove absence of real information: the ingress boundary must receive synthetic values only.
 
-## Phase 2 parking lot
-Real ADK/Vertex AI ZDR, source extraction and independent citation verifier, authenticated approval executor and effect lease, Pub/Sub outbox publisher/reconciliation, command center, Cloud SQL deployment/IAM and external connectors. No infrastructure or live client data authorized.
+The dedup key is SHA-256 of canonical compact JSON `[schema_version, firm_id, source, event_type, source_ref, source_version]`. Event ID, correlation ID, and receipt timestamp are delivery metadata and do not change this identity. A new source version or firm creates a new key. Source identifiers and provider signals are exact and case-sensitive; no fuzzy matching.
+
+At `ingest_event` / `receive`, freeze canonical `matter_signals`, `envelope_sha256`, optional `payload_sha256`, and combined `evidence_sha256` on `event_inbox`, alongside the source reference/version. Signals are sorted, unique, exact strings obtained from the trusted synthetic adapter boundary; an email or agent assertion is not trusted extraction. The canonical envelope digest excludes `event_id`, `correlation_id`, `received_at`, and the derived `dedup_key`; it includes intrinsic source metadata and `occurred_at`. Hashes use deterministic compact JSON serialization. Payload digest input is a digest, not permission to persist a body or retrieve live correspondence. These evidence columns are immutable after insertion.
+
+`resolve_run` loads the run's original inbox evidence and uses its extracted signals. An optional supplied signal list must canonically match the bound list; a mismatch is `Denied` and cannot rebind the run. Record immutable `resolution_evidence` JSONB with `run_id`, `inbox_id`, `source_reference`, `source_version`, `extracted_signals`, `matched_clio_ids`, `mapping_version`, `decision`, and `reason_code`. `mapping_version` records the matched provider ID/version mapping. The SQL resolution guard independently derives/checks the evidence against the originating inbox and current mapping; adapters cannot authorize an arbitrary matter by providing a JSON claim.
+
+Provider `clio_matter_id` is text and is distinct from internal UUID `verified_matter_id`. Match extracted provider signals to `clio_matter_id`; recheck resolved scope by `(firm_id, verified_matter_id)`. Never compare an internal UUID with a provider text identifier.
+
+## Scope, immutability, and database authority
+
+All 12 tables enable and force RLS. Four Tier A tables enforce scope-mode/nullability consistency. Inbox, intake outbox, and historical intake audit remain restricted. A run's current `verified_matter_id` is active scope. Its immutable `resolved_matter_id` anchors the original resolved matter and historical composite references, including audit/Tier B records, after active scope is withdrawn. Quarantine clears current scope without deleting or rewriting historical evidence. Matter-specific records carry nonnull historical verified matter and composite run/matter plus run/firm/matter FKs. Active access must also satisfy current eligibility and active scope; retained historical references do not permit continued processing.
+
+Application roles are dedicated NOLOGIN/NOSUPERUSER/NOBYPASSRLS identities: intake, resolver, worker, independent reviewer, attorney, and executor. They have no production login configuration, privilege-bearing membership, table ownership, or Tier B write grants. `wl_audit_writer` is a separate restricted NOLOGIN/NOSUPERUSER/NOBYPASSRLS role that owns the audit trigger function and has only the audit insertion/sequence privileges it needs. Application roles cannot directly insert, update, delete, or truncate audit events. The audit trigger validates its originating relation and records the calling service role while running under its isolated writer identity.
+
+The restricted `wl_scope_guard` role owns narrowly granted SECURITY DEFINER scope/replay/revalidation helpers. It has no members or login. Helpers validate trusted firm scope and allowed caller roles, use pinned `pg_catalog` search paths and schema-qualified relations, obey their RLS policies, and provide only the required operation. They do not expose general audit insertion, matter mutation, Tier B writes, or SQL execution. Temporary trigger forgery and temporary-table shadowing must not redirect these operations.
+
+Trusted services set transaction-local firm/matter GUCs; missing context denies reads. GUCs are scope context, not authentication or a defense against a compromised credential. Production authentication, credential isolation, pool security, tamper-evident audit storage, and operational ownership require separate verification before live use. SQL special constructs such as `NULLIF` and `COALESCE` use standard syntax; schema qualification applies to ordinary functions and relations, not those constructs.
+
+## Transactions, continuous eligibility, and replays
+
+`receive` / `ingest_event` writes inbox, run, initial audit, and outbox in one transaction. A unique `(source, dedup_key)` arbitrates concurrent acceptance. A matching duplicate returns the existing run ID with `False`, not a second run or outbox. The trusted firm-scoped intake service may receive that opaque identifier; this is not a general matter-data read path.
+
+On duplicate delivery, compare canonical envelope, signals, and payload evidence with the original inbox under the same replay-handling boundary. A contradiction never overwrites evidence. Any nonterminal run becomes `QUARANTINED`, `scope_mode='INTAKE_RESTRICTED'`, `verified_matter_id=NULL`, `reason_code='CONFLICTING_REPLAY_SIGNALS'`; append an audit anomaly. A terminal run retains its status and receives an anomaly without automatic reopening or retry. The helper serializes with run progress so a contradictory replay cannot race past quarantine.
+
+`resolve_run` reads only its bound inbox/run and firm-scoped mapping, locks relevant mapping rows `FOR SHARE`, records resolution evidence, and performs CAS. `transition` / `transition_run` requires a caller-owned idle psycopg 3 connection, trusted actor, expected state, and verified scope. Reject missing/non-string actors and undefined edges before comparing the required role. Atomic updates include run ID, firm, expected status, and expected current matter. Zero rows is `Denied`.
+
+Before any allowed `MATTER_VERIFIED` progress, the SQL guard and service layer revalidate OPEN eligibility using the internal firm/matter mapping with `FOR SHARE`. This includes `VALIDATED -> RUNNING` and `RUNNING -> REVIEW_REQUIRED`; mock-only approval/execution also rechecks eligibility. Mapping locks serialize concurrent eligibility revocation with progress. There is no unguarded specialist or simulated-effect path after revocation.
+
+`revalidate_matter_eligibility` returns whether the current mapping remains eligible. A revoked mapping on an active `VALIDATED`, `RUNNING`, `REVIEW_REQUIRED`, or mock `APPROVED` run causes an audited `MATTER_INELIGIBLE` quarantine, clears current scope, and preserves resolution evidence/historical scope. A requested progress operation commits this safety quarantine before raising `Denied`, so callers must not assume every denial leaves status unchanged. The blocked requested progress itself never occurs. A missing mapping is ineligible and cannot supply scope.
+
+SQL before-triggers independently enforce role/state, evidence, and scope rules. Audit and state changes share a transaction; audit failure rolls back the mutation. Source/step/approval/effect tables remain schema-only for application writes. The memory fake is single-threaded and is not proof of concurrency; the live gate exercises actual PostgreSQL locking, RLS, and rollback.
+
+## State edges and stopping rules
+
+The ordinary edges are `RECEIVED -> VALIDATED/QUARANTINED` (resolver), `VALIDATED -> RUNNING` (coordinator), `RUNNING -> REVIEW_REQUIRED` (independent review), `REVIEW_REQUIRED -> REJECTED` (attorney), `VALIDATED/RUNNING -> FAILED` (coordinator), and `VALIDATED/RUNNING/REVIEW_REQUIRED/APPROVED -> CANCELLED` (coordinator). Eligibility revocation and contradictory replay add the restricted safety-quarantine paths described above; they do not grant ordinary processing transitions to intake or agents.
+
+Only the in-memory policy executor exercises `REVIEW_REQUIRED -> APPROVED -> EXECUTING -> COMPLETED/NEEDS_RECONCILIATION`. It checks accepted approval binding, digest, expiry, source/policy versions, current eligibility, permissions, revocation, destination, kill switch, and effect deduplication. It is not production authentication or durable execution. SQL approval/execution edges remain disabled until a separately scoped persistent policy executor exists.
+
+Quarantine, failure, rejection, cancellation, completion, and reconciliation stop automatic processing. Reconciliation cannot be blindly retried. No autonomous legal decisions, deadlines, client acceptance, filing, or external effects are authorized.
+
+## Exact local verification gate
+
+Run from the repository root as a non-root local user with write access to `/tmp` and read access to the repository. PostgreSQL16+ tools `initdb`, `pg_ctl`, `psql`, and `createdb` must be available on `PATH`. The live suite always creates a fresh isolated temporary cluster on `127.0.0.1` plus a temporary Unix socket, creates `weaverlaw_pr1_test`, applies the migration, runs SQL assertions, and stops the cluster. It does not accept an existing database DSN. Roles are cluster-wide and the migration is intentionally non-idempotent; never run it against an existing or production database.
+
+Dependency setup in a reviewed local virtual environment (Python >=3.11):
+
+```sh
+python -m pip install 'pydantic>=2.10,<3' 'pytest>=8,<10' 'psycopg[binary]>=3.2,<4'
+```
+
+Verify prerequisites and run the required gate:
+
+```sh
+initdb --version
+pg_ctl --version
+psql --version
+createdb --version
+python -c "import psycopg, psycopg_binary; print(psycopg.__version__, psycopg_binary.__version__)"
+WEAVERLAW_REQUIRE_LIVE_PG=1 python -m pytest -v
+python -m compileall -q services tests
+git diff --check
+```
+
+The isolated pool regression can also be run independently:
+
+```sh
+WEAVERLAW_REQUIRE_LIVE_PG=1 python -m pytest tests/test_postgres_live.py -k pool -v
+```
+
+The required live gate must have zero skipped tests and zero errors. Report actual test counts and the exact pytest summary, environment versions, compilation/diff-check results, and working-tree state; do not hard-code a stale count into the contract. Coverage includes post-validation restriction, bound/mismatched resolution evidence, immutable evidence writes, contradictory duplicate replay, duplicate/CAS concurrency, two-session mapping revocation, forced RLS, temporary-trigger forgery, table shadowing, audit rollback, and pool cleanup. No real provider credentials or client records are needed.
+
+Require independent code/SQL review and owner acceptance before merge. No Cloud SQL migration or deployment is performed by this gate. Rollback for this slice is branch/PR review and disposal of the fresh local test cluster; do not drop real data or roles.
+
+## Phase 2 boundary
+
+ADK/Gemini runtime, real extraction and independent citation verification, live Clio/Gmail/Dropbox adapters, authenticated production approvals, persistent effect leases, Pub/Sub publishing/reconciliation, command center, Cloud SQL provisioning, IAM, deployment, and production data remain outside PR1. Local hardening of evidence, eligibility, replay, isolation, and fixtures does not activate those capabilities.

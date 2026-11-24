@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-09 Replay and recovery"
+  short_description: "Handle identical and contradictory replays without duplicate"
+  default_prompt: "Use $wl-09-replay-recovery to review replay evidence comparison, quarantine, and recovery behavior."

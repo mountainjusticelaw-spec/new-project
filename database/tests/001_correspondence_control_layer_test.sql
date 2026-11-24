@@ -15,8 +15,8 @@ INSERT INTO weaverlaw.matter_mapping VALUES
  ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000003','clio-002','OPEN','v1');
 SET LOCAL ROLE wl_intake;
 SELECT set_config('app.verified_firm_id','00000000-0000-0000-0000-000000000001',true),set_config('app.verified_matter_id','',true);
-INSERT INTO weaverlaw.event_inbox(inbox_id,firm_id,event_id,source,event_type,schema_version,occurred_at,received_at,correlation_id,source_ref,source_version,sensitivity,dedup_key)
-SELECT ('00000000-0000-0000-0000-00000000001'||n)::uuid,'00000000-0000-0000-0000-000000000001',('00000000-0000-0000-0000-00000000002'||n)::uuid,'synthetic.gmail','correspondence.received',1,now(),now(),'00000000-0000-0000-0000-000000000004','synthetic-msg-'||n,'v1','synthetic',repeat(n::text,64) FROM generate_series(1,3) n;
+INSERT INTO weaverlaw.event_inbox(inbox_id,firm_id,event_id,source,event_type,schema_version,occurred_at,received_at,correlation_id,source_ref,source_version,sensitivity,dedup_key,matter_signals,envelope_sha256,evidence_sha256)
+SELECT ('00000000-0000-0000-0000-00000000001'||n)::uuid,'00000000-0000-0000-0000-000000000001',('00000000-0000-0000-0000-00000000002'||n)::uuid,'synthetic.gmail','correspondence.received',1,now(),now(),'00000000-0000-0000-0000-000000000004','synthetic-msg-'||n,'v1','synthetic',repeat(n::text,64),pg_catalog.jsonb_build_array(CASE n WHEN 1 THEN 'clio-001' WHEN 2 THEN 'clio-002' ELSE 'unmapped-signal' END),repeat(n::text,64),repeat(n::text,64) FROM generate_series(1,3) n;
 INSERT INTO weaverlaw.workflow_run(run_id,firm_id,inbox_id)
 SELECT ('00000000-0000-0000-0000-00000000003'||n)::uuid,'00000000-0000-0000-0000-000000000001',('00000000-0000-0000-0000-00000000001'||n)::uuid FROM generate_series(1,3) n;
 INSERT INTO weaverlaw.outbox(outbox_id,firm_id,run_id,topic,idempotency_key)

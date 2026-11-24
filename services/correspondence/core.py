@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from hashlib import sha256
 import json
+import re
+from types import MappingProxyType
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, StringConstraints, computed_field, field_validator, model_validator
@@ -71,12 +73,52 @@ def digest(value):
                              ensure_ascii=True, allow_nan=False).encode()).hexdigest()
 
 
+def canonical_signals(signals):
+    """Copy exact trusted adapter signals, independent of delivery ordering."""
+    if signals is None or isinstance(signals, (str, bytes)):
+        raise Denied('trusted signal sequence required')
+    try:
+        values = tuple(signals)
+    except TypeError as err:
+        raise Denied('trusted signal sequence required') from err
+    if any(not isinstance(value, str) or not value for value in values):
+        raise Denied('invalid trusted signal')
+    return tuple(sorted(set(values)))
+
+
+def intake_evidence(envelope, signals, payload_sha256=None):
+    """Build metadata-only evidence; transport delivery IDs are not content."""
+    signals = canonical_signals(signals)
+    if payload_sha256 is not None and (
+        not isinstance(payload_sha256, str)
+        or re.fullmatch(r'[0-9a-f]{64}', payload_sha256) is None
+    ):
+        raise Denied('invalid payload digest')
+    metadata = envelope.model_dump(mode='json', exclude={
+        'event_id', 'correlation_id', 'received_at', 'dedup_key',
+    })
+    envelope_sha256 = digest(metadata)
+    return {
+        'matter_signals': signals,
+        'envelope_sha256': envelope_sha256,
+        'payload_sha256': payload_sha256,
+        'evidence_sha256': digest([envelope_sha256, signals, payload_sha256]),
+        'source_reference': envelope.source_ref,
+        'source_version': envelope.source_version,
+    }
+
+
+def evidence_digest(envelope, signals, payload_sha256=None):
+    return intake_evidence(envelope, signals, payload_sha256)['evidence_sha256']
+
+
 @dataclass(frozen=True)
 class Mapping:
     firm_id: UUID
     matter_id: UUID
     clio_id: str
     eligibility: Literal['OPEN','CLOSED','RESTRICTED'] = 'OPEN'
+    mapping_version: str = 'v1'
 
 
 class Resolver:
@@ -84,7 +126,7 @@ class Resolver:
         self.mappings = tuple(mappings)
 
     def resolve(self, firm_id, signals):
-        signals = tuple(dict.fromkeys(signals))
+        signals = canonical_signals(signals)
         groups = [tuple(m for m in self.mappings if m.firm_id == firm_id and m.clio_id == s)
                   for s in signals]
         matches = {m.matter_id for group in groups for m in group}
@@ -139,9 +181,15 @@ EDGES = {
     (State.EXECUTING,State.NEEDS_RECONCILIATION):Actor.POLICY_EXECUTOR,
     **{(s,State.CANCELLED):Actor.COORDINATOR for s in (State.VALIDATED,State.RUNNING,State.REVIEW_REQUIRED,State.APPROVED)},
     **{(s,State.FAILED):Actor.COORDINATOR for s in (State.VALIDATED,State.RUNNING)},
+    **{(s,State.QUARANTINED):Actor.RESOLVER for s in (
+        State.VALIDATED,State.RUNNING,State.REVIEW_REQUIRED,State.APPROVED,State.EXECUTING,
+    )},
 }
 RESERVED = {State.APPROVED,State.EXECUTING,State.COMPLETED,State.NEEDS_RECONCILIATION}
-QUARANTINE_REASONS = {'UNMAPPED_MATTER_SIGNAL','CONFLICTING_MATTER_SIGNALS','MATTER_INELIGIBLE'}
+QUARANTINE_REASONS = {'UNMAPPED_MATTER_SIGNAL','CONFLICTING_MATTER_SIGNALS',
+                      'MATTER_INELIGIBLE','CONFLICTING_REPLAY_SIGNALS'}
+TERMINAL = {State.QUARANTINED,State.FAILED,State.REJECTED,State.CANCELLED,
+            State.COMPLETED,State.NEEDS_RECONCILIATION}
 
 
 def check_edge(expected, target, actor, matter_id, reason, *, mock=False):
@@ -237,6 +285,26 @@ class Run:
     matter_id: UUID | None = None
     audit: list[Audit] = field(default_factory=list)
     accepted_approval: AcceptedApproval | None = None
+    _intake: object = field(default=None, repr=False, compare=False)
+    _intake_evidence: object = field(default=None, repr=False)
+    _resolution_evidence: object = field(default=None, repr=False)
+    _resolved_matter_id: UUID | None = field(default=None, repr=False)
+
+    @property
+    def intake_evidence(self):
+        return self._intake_evidence
+
+    @property
+    def resolution_evidence(self):
+        return self._resolution_evidence
+
+    @property
+    def resolved_matter_id(self):
+        return self._resolved_matter_id
+
+    def _require_eligibility(self, now):
+        if self._intake is None or not self._intake.revalidate_run(self, now):
+            raise Denied('matter is no longer eligible')
 
     @property
     def scope_mode(self):
@@ -257,8 +325,12 @@ class Run:
             or self.accepted_approval is not None
         ):
             raise Denied('approval binding denied')
-        matter = resolved_matter if resolved_matter is not None else self.matter_id
+        matter = None if target == State.QUARANTINED else (
+            resolved_matter if resolved_matter is not None else self.matter_id
+        )
         check_edge(expected,target,actor,matter,reason,mock=mock)
+        if self.matter_id is not None and target != State.QUARANTINED:
+            self._require_eligibility(now)
         self.matter_id, self.status = matter, target
         if accepted_approval is not None:
             self.accepted_approval = accepted_approval
@@ -274,25 +346,93 @@ class Intake:
         self.steps = []
         self.agent_calls = []
 
-    def accept(self, envelope, signals):
+    def _owned(self, run):
+        if (run._intake is not self
+            or not any(existing is run for existing in self.runs.values())
+            or run.intake_evidence is None
+            or run.intake_evidence['firm_id'] != str(run.firm_id)
+            or run.intake_evidence['run_id'] != str(run.run_id)):
+            raise Denied('run is not owned by this intake')
+
+    def _quarantine(self, run, now, reason):
+        if run.status in TERMINAL:
+            # Preserve terminal disposition and scope while recording the anomaly.
+            run.audit.append(Audit(run.status,Actor.RESOLVER,reason,now))
+        else:
+            run.move(run.status,State.QUARANTINED,Actor.RESOLVER,now,reason)
+
+    def ingest_event(self, envelope, signals, *, payload_sha256=None):
+        evidence = intake_evidence(envelope, signals, payload_sha256)
         key = (envelope.source,envelope.dedup_key)
         if key in self.runs:
-            return self.runs[key], False
-        run = Run(envelope.firm_id)
+            run = self.runs[key]
+            if evidence['evidence_sha256'] != run.intake_evidence['evidence_sha256']:
+                self._quarantine(run,envelope.received_at,'CONFLICTING_REPLAY_SIGNALS')
+            return run, False
+        run = Run(envelope.firm_id, _intake=self)
+        run._intake_evidence = MappingProxyType({
+            **evidence, 'inbox_id': str(uuid4()),
+            'run_id': str(run.run_id), 'firm_id': str(run.firm_id),
+        })
         run.audit.append(Audit(State.RECEIVED,Actor.INGRESS,'ACCEPTED',envelope.received_at))
-        matter, reason = self.resolver.resolve(envelope.firm_id,signals)
-        run.move(State.RECEIVED,State.VALIDATED if matter else State.QUARANTINED,
-                 Actor.RESOLVER,envelope.received_at,reason,resolved_matter=matter)
         self.runs[key] = run
-        self.outbox.append((run.run_id,'RESOLUTION_RECORDED'))
+        self.outbox.append((run.run_id,'RESOLUTION_PENDING'))
         return run, True
 
+    def resolve_run(self, run, signals=None, *, trusted_signals=None, now=None):
+        self._owned(run)
+        evidence = run.intake_evidence
+        for supplied in (signals, trusted_signals):
+            if supplied is not None and canonical_signals(supplied) != evidence['matter_signals']:
+                raise Denied('resolution signals do not match immutable intake evidence')
+        if run.status != State.RECEIVED or run.resolution_evidence is not None:
+            raise Denied('stale resolution')
+        now = now if now is not None else run.audit[0].at
+        matter, reason = self.resolver.resolve(run.firm_id,evidence['matter_signals'])
+        target = State.VALIDATED if matter else State.QUARANTINED
+        matched = tuple(sorted(
+            (m for m in self.resolver.mappings
+             if m.firm_id == run.firm_id and m.clio_id in evidence['matter_signals']),
+            key=lambda m: (m.clio_id,str(m.matter_id),m.mapping_version),
+        ))
+        snapshot = MappingProxyType({
+            'run_id': str(run.run_id), 'inbox_id': evidence['inbox_id'],
+            'source_reference': evidence['source_reference'],
+            'source_version': evidence['source_version'],
+            'extracted_signals': evidence['matter_signals'],
+            'matched_clio_ids': tuple(sorted({m.clio_id for m in matched})),
+            'mapping_version': MappingProxyType({m.clio_id:m.mapping_version for m in matched}),
+            'decision': target.value, 'reason_code': reason,
+        })
+        run.move(State.RECEIVED,target,Actor.RESOLVER,now,reason,resolved_matter=matter)
+        run._resolved_matter_id = matter
+        run._resolution_evidence = snapshot
+        return target, matter, reason
+
+    def accept(self, envelope, signals, *, payload_sha256=None):
+        run, created = self.ingest_event(envelope,signals,payload_sha256=payload_sha256)
+        if created:
+            self.resolve_run(run,now=envelope.received_at)
+        return run, created
+
+    def revalidate_run(self, run, now):
+        self._owned(run)
+        if run.status in TERMINAL or run.matter_id is None or run.resolution_evidence is None:
+            return False
+        matter, reason = self.resolver.resolve(run.firm_id,run.intake_evidence['matter_signals'])
+        if reason != 'MATTER_VERIFIED' or matter != run.resolved_matter_id or matter != run.matter_id:
+            self._quarantine(run,now,'MATTER_INELIGIBLE')
+            return False
+        return True
+
     def start(self, run, now):
+        self._owned(run)
         run.move(State.VALIDATED,State.RUNNING,Actor.COORDINATOR,now,'START')
         self.steps.append((run.run_id,run.matter_id))
         self.agent_calls.append((run.run_id,'SYNTHETIC_STUB'))
 
     def review(self, run, now, *, independently_checked):
+        self._owned(run)
         if independently_checked is not True:
             raise Denied('independent review required')
         run.move(State.RUNNING,State.REVIEW_REQUIRED,Actor.INDEPENDENT_REVIEW,now,'SYNTHETIC_REVIEW')

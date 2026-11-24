@@ -10,8 +10,9 @@ CREATE ROLE wl_reviewer NOLOGIN NOSUPERUSER NOBYPASSRLS;
 CREATE ROLE wl_attorney NOLOGIN NOSUPERUSER NOBYPASSRLS;
 CREATE ROLE wl_executor NOLOGIN NOSUPERUSER NOBYPASSRLS;
 CREATE ROLE wl_audit_writer NOLOGIN NOSUPERUSER NOBYPASSRLS;
+CREATE ROLE wl_scope_guard NOLOGIN NOSUPERUSER NOBYPASSRLS;
 REVOKE ALL ON SCHEMA weaverlaw FROM PUBLIC;
-GRANT USAGE ON SCHEMA weaverlaw TO wl_intake,wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_executor,wl_audit_writer;
+GRANT USAGE ON SCHEMA weaverlaw TO wl_intake,wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_executor,wl_audit_writer,wl_scope_guard;
 CREATE TYPE weaverlaw.scope_mode AS ENUM ('INTAKE_RESTRICTED','MATTER_VERIFIED');
 CREATE TYPE weaverlaw.run_status AS ENUM ('RECEIVED','VALIDATED','RUNNING','REVIEW_REQUIRED','APPROVED','EXECUTING','COMPLETED','REJECTED','FAILED','QUARANTINED','CANCELLED','NEEDS_RECONCILIATION');
 CREATE DOMAIN weaverlaw.hex_digest AS text CHECK (VALUE ~ '^[0-9a-f]{64}$');
@@ -30,27 +31,45 @@ CREATE TABLE weaverlaw.matter_mapping (
  eligibility text NOT NULL CHECK (eligibility IN ('OPEN','CLOSED','RESTRICTED')),
  mapping_version weaverlaw.opaque_id NOT NULL, PRIMARY KEY (firm_id,verified_matter_id), UNIQUE(firm_id,clio_matter_id)
 );
+-- Canonical immutable adapter evidence: exact strings, sorted and deduplicated.
+CREATE FUNCTION weaverlaw.canonical_signals(signals jsonb) RETURNS jsonb LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog AS $$
+DECLARE result jsonb;
+BEGIN
+ IF signals IS NULL OR pg_catalog.jsonb_typeof(signals) <> 'array' OR EXISTS(
+  SELECT 1 FROM pg_catalog.jsonb_array_elements(signals) item WHERE pg_catalog.jsonb_typeof(item) <> 'string'
+ ) THEN RAISE EXCEPTION 'signal array required' USING ERRCODE='23514'; END IF;
+ SELECT COALESCE(pg_catalog.jsonb_agg(value ORDER BY value COLLATE "C"), '[]'::pg_catalog.jsonb) INTO result
+ FROM (SELECT DISTINCT value COLLATE "C" AS value FROM pg_catalog.jsonb_array_elements_text(signals)) items;
+ RETURN result;
+END $$;
 CREATE TABLE weaverlaw.event_inbox (
  inbox_id uuid PRIMARY KEY, firm_id uuid NOT NULL, event_id uuid NOT NULL, source text NOT NULL CHECK(source='synthetic.gmail'),
  event_type text NOT NULL CHECK(event_type='correspondence.received'), schema_version integer NOT NULL CHECK(schema_version=1),
  occurred_at timestamptz NOT NULL, received_at timestamptz NOT NULL CHECK(received_at>=occurred_at), correlation_id uuid NOT NULL,
  source_ref weaverlaw.opaque_id NOT NULL CHECK(source_ref LIKE 'synthetic-%'), source_version weaverlaw.opaque_id NOT NULL, sensitivity text NOT NULL CHECK(sensitivity='synthetic'), dedup_key weaverlaw.hex_digest NOT NULL,
+ matter_signals jsonb NOT NULL DEFAULT '[]'::pg_catalog.jsonb CHECK(matter_signals=weaverlaw.canonical_signals(matter_signals)),
+ envelope_sha256 weaverlaw.hex_digest NOT NULL,
+ payload_sha256 weaverlaw.hex_digest,
+ evidence_sha256 weaverlaw.hex_digest NOT NULL,
  scope_mode weaverlaw.scope_mode NOT NULL DEFAULT 'INTAKE_RESTRICTED'::weaverlaw.scope_mode, verified_matter_id uuid,
  CHECK(weaverlaw.scope_valid(scope_mode,verified_matter_id)), UNIQUE(source,dedup_key), UNIQUE(inbox_id,firm_id),
  FOREIGN KEY(firm_id,verified_matter_id) REFERENCES weaverlaw.matter_mapping(firm_id,verified_matter_id)
 );
 CREATE TABLE weaverlaw.workflow_run (
  run_id uuid PRIMARY KEY, firm_id uuid NOT NULL, inbox_id uuid NOT NULL UNIQUE,
+ resolved_matter_id uuid, resolution_evidence jsonb CHECK(resolution_evidence IS NULL OR pg_catalog.jsonb_typeof(resolution_evidence)='object'),
  scope_mode weaverlaw.scope_mode NOT NULL DEFAULT 'INTAKE_RESTRICTED'::weaverlaw.scope_mode, verified_matter_id uuid,
  status weaverlaw.run_status NOT NULL DEFAULT 'RECEIVED'::weaverlaw.run_status, reason_code weaverlaw.opaque_id NOT NULL DEFAULT 'ACCEPTED'::weaverlaw.opaque_id,
  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
  CHECK(weaverlaw.scope_valid(scope_mode,verified_matter_id)),
  CHECK(status NOT IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status,'EXECUTING'::weaverlaw.run_status,'COMPLETED'::weaverlaw.run_status,'REJECTED'::weaverlaw.run_status,'FAILED'::weaverlaw.run_status,'CANCELLED'::weaverlaw.run_status,'NEEDS_RECONCILIATION'::weaverlaw.run_status) OR (scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND verified_matter_id IS NOT NULL)),
+ CHECK(verified_matter_id IS NULL OR (resolved_matter_id IS NOT NULL AND verified_matter_id=resolved_matter_id)),
  CHECK(status NOT IN ('RECEIVED'::weaverlaw.run_status,'QUARANTINED'::weaverlaw.run_status) OR scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode),
- CHECK(status <> 'QUARANTINED'::weaverlaw.run_status OR reason_code IN ('UNMAPPED_MATTER_SIGNAL','CONFLICTING_MATTER_SIGNALS','MATTER_INELIGIBLE')),
- UNIQUE(run_id,verified_matter_id), UNIQUE(run_id,firm_id), UNIQUE(run_id,firm_id,verified_matter_id),
+ CHECK(status <> 'QUARANTINED'::weaverlaw.run_status OR reason_code IN ('UNMAPPED_MATTER_SIGNAL','CONFLICTING_MATTER_SIGNALS','MATTER_INELIGIBLE','CONFLICTING_REPLAY_SIGNALS')),
+ UNIQUE(run_id,resolved_matter_id), UNIQUE(run_id,firm_id), UNIQUE(run_id,firm_id,resolved_matter_id),
  FOREIGN KEY(inbox_id,firm_id) REFERENCES weaverlaw.event_inbox(inbox_id,firm_id),
- FOREIGN KEY(firm_id,verified_matter_id) REFERENCES weaverlaw.matter_mapping(firm_id,verified_matter_id)
+ FOREIGN KEY(firm_id,verified_matter_id) REFERENCES weaverlaw.matter_mapping(firm_id,verified_matter_id),
+ FOREIGN KEY(firm_id,resolved_matter_id) REFERENCES weaverlaw.matter_mapping(firm_id,verified_matter_id)
 );
 CREATE TABLE weaverlaw.outbox (
  outbox_id uuid PRIMARY KEY, firm_id uuid NOT NULL, run_id uuid NOT NULL,
@@ -59,7 +78,7 @@ CREATE TABLE weaverlaw.outbox (
  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
  CHECK(weaverlaw.scope_valid(scope_mode,verified_matter_id)), UNIQUE(run_id,topic),
  FOREIGN KEY(run_id,firm_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id)
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id)
 );
 CREATE TABLE weaverlaw.audit_event (
  audit_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, firm_id uuid NOT NULL, run_id uuid NOT NULL,
@@ -68,7 +87,7 @@ CREATE TABLE weaverlaw.audit_event (
  occurred_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
  CHECK(weaverlaw.scope_valid(scope_mode,verified_matter_id)),
  FOREIGN KEY(run_id,firm_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id)
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id)
 );
 -- Tier B: all seven tables have nonnullable verified scope and BOTH composite FKs.
 CREATE TABLE weaverlaw.workflow_step (
@@ -76,14 +95,14 @@ CREATE TABLE weaverlaw.workflow_step (
  step_name weaverlaw.opaque_id NOT NULL, idempotency_key weaverlaw.opaque_id NOT NULL, attempt integer NOT NULL DEFAULT 1 CHECK(attempt BETWEEN 1 AND 3),
  status text NOT NULL CHECK(status IN ('PENDING','RUNNING','SUCCEEDED','FAILED')),
  UNIQUE(run_id,idempotency_key), UNIQUE(step_id,run_id,firm_id,verified_matter_id),
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id)
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id)
 );
 CREATE TABLE weaverlaw.agent_run (
  agent_run_id uuid PRIMARY KEY, firm_id uuid NOT NULL, run_id uuid NOT NULL, verified_matter_id uuid NOT NULL, step_id uuid NOT NULL,
  model_version weaverlaw.opaque_id NOT NULL, prompt_version weaverlaw.opaque_id NOT NULL, schema_version weaverlaw.opaque_id NOT NULL, tool_version weaverlaw.opaque_id NOT NULL,
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id),
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id),
  FOREIGN KEY(step_id,run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_step(step_id,run_id,firm_id,verified_matter_id)
 );
 CREATE TABLE weaverlaw.source_reference (
@@ -91,16 +110,16 @@ CREATE TABLE weaverlaw.source_reference (
  source_system text NOT NULL CHECK(source_system IN ('synthetic.gmail','synthetic.dropbox')), external_id weaverlaw.opaque_id NOT NULL,
  source_version weaverlaw.opaque_id NOT NULL, sha256 weaverlaw.hex_digest NOT NULL, family_id uuid, page_number integer CHECK(page_number>0),
  UNIQUE(run_id,source_system,external_id,source_version), UNIQUE(source_id,run_id,firm_id,verified_matter_id),
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id)
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id)
 );
 CREATE TABLE weaverlaw.work_product (
  work_product_id uuid PRIMARY KEY, firm_id uuid NOT NULL, run_id uuid NOT NULL, verified_matter_id uuid NOT NULL,
  source_id uuid NOT NULL, version integer NOT NULL CHECK(version>0),
  review_banner text NOT NULL DEFAULT 'PROPOSED WORK PRODUCT — REQUIRES GEORGIA ATTORNEY REVIEW' CHECK(review_banner='PROPOSED WORK PRODUCT — REQUIRES GEORGIA ATTORNEY REVIEW'),
  content jsonb NOT NULL CHECK(pg_catalog.jsonb_typeof(content)='object'),
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id),
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id),
  FOREIGN KEY(source_id,run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.source_reference(source_id,run_id,firm_id,verified_matter_id)
 );
 CREATE TABLE weaverlaw.action_proposal (
@@ -109,16 +128,16 @@ CREATE TABLE weaverlaw.action_proposal (
  source_reference_versions jsonb NOT NULL CHECK(pg_catalog.jsonb_typeof(source_reference_versions)='array' AND pg_catalog.jsonb_array_length(source_reference_versions)>0),
  policy_version weaverlaw.opaque_id NOT NULL, action_digest weaverlaw.hex_digest NOT NULL,
  UNIQUE(proposal_id,run_id,firm_id,verified_matter_id,action_digest,policy_version,destination),
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id)
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id)
 );
 CREATE TABLE weaverlaw.approval (
  approval_id uuid PRIMARY KEY, firm_id uuid NOT NULL, run_id uuid NOT NULL, verified_matter_id uuid NOT NULL,
  proposal_id uuid NOT NULL, action_digest weaverlaw.hex_digest NOT NULL, policy_version weaverlaw.opaque_id NOT NULL, destination weaverlaw.opaque_id NOT NULL,
  reviewer_id uuid NOT NULL, approved_at timestamptz NOT NULL, expires_at timestamptz NOT NULL CHECK(expires_at>approved_at), revoked_at timestamptz,
  UNIQUE(approval_id,run_id,firm_id,verified_matter_id,action_digest),
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id),
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id),
  FOREIGN KEY(proposal_id,run_id,firm_id,verified_matter_id,action_digest,policy_version,destination)
  REFERENCES weaverlaw.action_proposal(proposal_id,run_id,firm_id,verified_matter_id,action_digest,policy_version,destination)
 );
@@ -127,10 +146,38 @@ CREATE TABLE weaverlaw.effect_journal (
  approval_id uuid NOT NULL, action_digest weaverlaw.hex_digest NOT NULL, idempotency_key weaverlaw.hex_digest NOT NULL,
  status text NOT NULL CHECK(status IN ('LEASED','CONFIRMED','NEEDS_RECONCILIATION')), lease_id uuid NOT NULL,
  UNIQUE(firm_id,verified_matter_id,idempotency_key),
- FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,verified_matter_id),
- FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,verified_matter_id),
+ FOREIGN KEY(run_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,resolved_matter_id),
+ FOREIGN KEY(run_id,firm_id,verified_matter_id) REFERENCES weaverlaw.workflow_run(run_id,firm_id,resolved_matter_id),
  FOREIGN KEY(approval_id,run_id,firm_id,verified_matter_id,action_digest) REFERENCES weaverlaw.approval(approval_id,run_id,firm_id,verified_matter_id,action_digest)
 );
+-- Scope helpers reveal only authorization booleans; the internal role has no members.
+CREATE FUNCTION weaverlaw.mapping_is_open(p_firm uuid, p_matter uuid) RETURNS boolean
+ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+ SELECT p_firm=weaverlaw.context_firm() AND EXISTS(
+  SELECT 1 FROM weaverlaw.matter_mapping m WHERE m.firm_id=p_firm AND m.verified_matter_id=p_matter AND m.eligibility='OPEN'
+ )
+$$;
+ALTER FUNCTION weaverlaw.mapping_is_open(uuid,uuid) OWNER TO wl_scope_guard;
+-- Volatile lock check is also used by direct transition triggers, not only the adapter.
+CREATE FUNCTION weaverlaw.lock_mapping_is_open(p_firm uuid,p_matter uuid) RETURNS boolean
+ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_open boolean;
+BEGIN
+ IF p_firm IS DISTINCT FROM weaverlaw.context_firm() OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN RETURN false; END IF;
+ SELECT m.eligibility='OPEN' INTO v_open FROM weaverlaw.matter_mapping m
+  WHERE m.firm_id=p_firm AND m.verified_matter_id=p_matter FOR SHARE;
+ RETURN COALESCE(v_open,false);
+END $$;
+ALTER FUNCTION weaverlaw.lock_mapping_is_open(uuid,uuid) OWNER TO wl_scope_guard;
+CREATE FUNCTION weaverlaw.scope_is_active(p_run uuid,p_firm uuid,p_matter uuid) RETURNS boolean
+ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$
+ SELECT p_firm=weaverlaw.context_firm() AND EXISTS(
+  SELECT 1 FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.firm_id=p_firm
+   AND r.scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND r.verified_matter_id=p_matter
+   AND weaverlaw.mapping_is_open(p_firm,p_matter)
+ )
+$$;
+ALTER FUNCTION weaverlaw.scope_is_active(uuid,uuid,uuid) OWNER TO wl_scope_guard;
 -- All tables force RLS. No public policies; absent scope is deny-by-default.
 DO $$ DECLARE t text; BEGIN
  FOREACH t IN ARRAY ARRAY['matter_mapping','event_inbox','workflow_run','outbox','audit_event','workflow_step','agent_run','source_reference','work_product','action_proposal','approval','effect_journal'] LOOP
@@ -139,27 +186,37 @@ DO $$ DECLARE t text; BEGIN
  END LOOP;
  FOREACH t IN ARRAY ARRAY['event_inbox','workflow_run','outbox','audit_event'] LOOP
   EXECUTE pg_catalog.format('CREATE POLICY intake_read ON weaverlaw.%I FOR SELECT TO wl_intake,wl_resolver USING (firm_id=weaverlaw.context_firm() AND scope_mode=''INTAKE_RESTRICTED''::weaverlaw.scope_mode)',t);
-  EXECUTE pg_catalog.format('CREATE POLICY matter_read ON weaverlaw.%I FOR SELECT TO wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_executor USING (firm_id=weaverlaw.context_firm() AND scope_mode=''MATTER_VERIFIED''::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter())',t);
+  IF t IN ('workflow_run','event_inbox') THEN
+   EXECUTE pg_catalog.format('CREATE POLICY matter_read ON weaverlaw.%I FOR SELECT TO wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_executor USING (firm_id=weaverlaw.context_firm() AND scope_mode=''MATTER_VERIFIED''::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter() AND weaverlaw.mapping_is_open(firm_id,verified_matter_id))',t);
+  ELSE
+   EXECUTE pg_catalog.format('CREATE POLICY matter_read ON weaverlaw.%I FOR SELECT TO wl_resolver,wl_worker,wl_reviewer,wl_attorney,wl_executor USING (firm_id=weaverlaw.context_firm() AND scope_mode=''MATTER_VERIFIED''::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter() AND weaverlaw.scope_is_active(run_id,firm_id,verified_matter_id))',t);
+  END IF;
  END LOOP;
  FOREACH t IN ARRAY ARRAY['workflow_step','agent_run','source_reference','work_product','action_proposal','approval','effect_journal'] LOOP
-  EXECUTE pg_catalog.format('CREATE POLICY matter_read ON weaverlaw.%I FOR SELECT TO wl_worker,wl_reviewer,wl_attorney,wl_executor USING (firm_id=weaverlaw.context_firm() AND verified_matter_id=weaverlaw.context_matter())',t);
+  EXECUTE pg_catalog.format('CREATE POLICY matter_read ON weaverlaw.%I FOR SELECT TO wl_worker,wl_reviewer,wl_attorney,wl_executor USING (firm_id=weaverlaw.context_firm() AND verified_matter_id=weaverlaw.context_matter() AND weaverlaw.scope_is_active(run_id,firm_id,verified_matter_id))',t);
  END LOOP;
 END $$;
-CREATE POLICY mapping_resolve ON weaverlaw.matter_mapping FOR SELECT TO wl_resolver USING(firm_id=weaverlaw.context_firm());
+CREATE POLICY mapping_resolve ON weaverlaw.matter_mapping FOR SELECT TO wl_resolver,wl_scope_guard USING(firm_id=weaverlaw.context_firm());
 -- Permit FOR SHARE row locking during resolution while denying any actual UPDATE via WITH CHECK (false) and trigger.
-CREATE POLICY mapping_lock_only ON weaverlaw.matter_mapping FOR UPDATE TO wl_resolver USING(firm_id=weaverlaw.context_firm()) WITH CHECK(false);
+CREATE POLICY mapping_lock_only ON weaverlaw.matter_mapping FOR UPDATE TO wl_resolver,wl_scope_guard USING(firm_id=weaverlaw.context_firm()) WITH CHECK(false);
 -- Seed only as the migration owner via explicitly reviewed fixture grants/policy; no app mutation.
 CREATE POLICY inbox_insert ON weaverlaw.event_inbox FOR INSERT TO wl_intake WITH CHECK(firm_id=weaverlaw.context_firm() AND scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode);
-CREATE POLICY run_insert ON weaverlaw.workflow_run FOR INSERT TO wl_intake WITH CHECK(firm_id=weaverlaw.context_firm() AND scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode AND status='RECEIVED'::weaverlaw.run_status AND reason_code='ACCEPTED');
+CREATE POLICY run_insert ON weaverlaw.workflow_run FOR INSERT TO wl_intake WITH CHECK(firm_id=weaverlaw.context_firm() AND scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode AND status='RECEIVED'::weaverlaw.run_status AND reason_code='ACCEPTED' AND resolved_matter_id IS NULL AND resolution_evidence IS NULL);
 CREATE POLICY outbox_insert ON weaverlaw.outbox FOR INSERT TO wl_intake WITH CHECK(firm_id=weaverlaw.context_firm() AND scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode);
 CREATE POLICY resolve_update ON weaverlaw.workflow_run FOR UPDATE TO wl_resolver USING(firm_id=weaverlaw.context_firm() AND scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode) WITH CHECK(firm_id=weaverlaw.context_firm() AND (scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode OR (scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter())));
 CREATE POLICY worker_update ON weaverlaw.workflow_run FOR UPDATE TO wl_worker,wl_reviewer,wl_attorney USING(firm_id=weaverlaw.context_firm() AND scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter()) WITH CHECK(firm_id=weaverlaw.context_firm() AND scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter());
+CREATE POLICY guard_run_read ON weaverlaw.workflow_run FOR SELECT TO wl_scope_guard USING(firm_id=weaverlaw.context_firm());
+CREATE POLICY guard_run_update ON weaverlaw.workflow_run FOR UPDATE TO wl_scope_guard USING(firm_id=weaverlaw.context_firm()) WITH CHECK(firm_id=weaverlaw.context_firm());
+CREATE POLICY guard_inbox_read ON weaverlaw.event_inbox FOR SELECT TO wl_scope_guard USING(firm_id=weaverlaw.context_firm());
 CREATE POLICY audit_insert_intake ON weaverlaw.audit_event FOR INSERT TO wl_audit_writer WITH CHECK(current_user='wl_audit_writer' AND pg_catalog.pg_trigger_depth()>0 AND firm_id=weaverlaw.context_firm() AND scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode);
 CREATE POLICY audit_insert_matter ON weaverlaw.audit_event FOR INSERT TO wl_audit_writer WITH CHECK(current_user='wl_audit_writer' AND pg_catalog.pg_trigger_depth()>0 AND firm_id=weaverlaw.context_firm() AND scope_mode='MATTER_VERIFIED'::weaverlaw.scope_mode AND verified_matter_id=weaverlaw.context_matter());
+CREATE POLICY audit_insert_replay_anomaly ON weaverlaw.audit_event FOR INSERT TO wl_audit_writer WITH CHECK(current_user='wl_audit_writer' AND firm_id=weaverlaw.context_firm() AND reason_code='CONFLICTING_REPLAY_SIGNALS' AND old_status=new_status);
 -- PR1 deliberately grants no Tier B writes, approval grants, or executor mutations.
 GRANT SELECT,INSERT ON weaverlaw.event_inbox,weaverlaw.workflow_run,weaverlaw.outbox TO wl_intake;
 GRANT SELECT ON weaverlaw.matter_mapping,weaverlaw.event_inbox,weaverlaw.workflow_run,weaverlaw.outbox,weaverlaw.audit_event TO wl_resolver;
-GRANT UPDATE(eligibility) ON weaverlaw.matter_mapping TO wl_resolver;
+GRANT UPDATE(eligibility) ON weaverlaw.matter_mapping TO wl_resolver,wl_scope_guard;
+GRANT SELECT ON weaverlaw.matter_mapping,weaverlaw.event_inbox,weaverlaw.workflow_run TO wl_scope_guard;
+GRANT UPDATE(status,reason_code,scope_mode,verified_matter_id) ON weaverlaw.workflow_run TO wl_scope_guard;
 GRANT UPDATE(status,reason_code,scope_mode,verified_matter_id) ON weaverlaw.workflow_run TO wl_resolver,wl_worker,wl_reviewer,wl_attorney;
 GRANT SELECT ON weaverlaw.workflow_run,weaverlaw.audit_event,weaverlaw.workflow_step,weaverlaw.agent_run,weaverlaw.source_reference,weaverlaw.work_product,weaverlaw.action_proposal,weaverlaw.approval,weaverlaw.effect_journal TO wl_worker,wl_reviewer,wl_attorney;
 GRANT INSERT ON weaverlaw.audit_event TO wl_audit_writer;
@@ -168,25 +225,74 @@ REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON weaverlaw.audit_event FROM PUBLIC,wl_int
 REVOKE UPDATE,DELETE,TRUNCATE ON weaverlaw.audit_event FROM wl_audit_writer;
 CREATE FUNCTION weaverlaw.deny_app_mapping_mutation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
- IF current_user IN ('wl_intake','wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor','wl_audit_writer') THEN
+ IF current_user IN ('wl_intake','wl_resolver','wl_worker','wl_reviewer','wl_attorney','wl_executor','wl_audit_writer','wl_scope_guard') THEN
   RAISE EXCEPTION 'matter_mapping is read-only for application roles' USING ERRCODE='42501';
  END IF;
  IF TG_OP='DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;
 END $$;
 CREATE TRIGGER mapping_immutable_for_app BEFORE INSERT OR UPDATE OR DELETE ON weaverlaw.matter_mapping FOR EACH ROW EXECUTE FUNCTION weaverlaw.deny_app_mapping_mutation();
+CREATE FUNCTION weaverlaw.deny_inbox_mutation() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN RAISE EXCEPTION 'immutable intake evidence' USING ERRCODE='23514'; END $$;
+CREATE TRIGGER inbox_immutable BEFORE UPDATE OR DELETE ON weaverlaw.event_inbox FOR EACH ROW EXECUTE FUNCTION weaverlaw.deny_inbox_mutation();
 -- Defense-in-depth: even a direct UPDATE by a permitted service role must obey edges.
 CREATE FUNCTION weaverlaw.enforce_run_edge() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+ v_actor text := COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user);
+ v_inbox weaverlaw.event_inbox%ROWTYPE;
+ v_matches jsonb; v_versions jsonb; v_count integer; v_matter uuid;
+ v_reason text; v_target weaverlaw.run_status;
 BEGIN
- IF NEW.run_id<>OLD.run_id OR NEW.firm_id<>OLD.firm_id OR NEW.inbox_id<>OLD.inbox_id THEN RAISE EXCEPTION 'immutable run identity'; END IF;
- IF OLD.status='RECEIVED'::weaverlaw.run_status AND current_user='wl_resolver' AND NEW.status IN ('VALIDATED'::weaverlaw.run_status,'QUARANTINED'::weaverlaw.run_status) THEN
-  IF NEW.status='VALIDATED'::weaverlaw.run_status AND NOT EXISTS(SELECT 1 FROM weaverlaw.matter_mapping m WHERE m.firm_id=NEW.firm_id AND m.verified_matter_id=NEW.verified_matter_id AND m.eligibility='OPEN') THEN RAISE EXCEPTION 'matter not eligible'; END IF;
+ IF NEW.run_id<>OLD.run_id OR NEW.firm_id<>OLD.firm_id OR NEW.inbox_id<>OLD.inbox_id THEN RAISE EXCEPTION 'immutable run identity' USING ERRCODE='23514'; END IF;
+ IF OLD.resolution_evidence IS NOT NULL AND NEW.resolution_evidence IS DISTINCT FROM OLD.resolution_evidence
+  OR OLD.resolved_matter_id IS NOT NULL AND NEW.resolved_matter_id IS DISTINCT FROM OLD.resolved_matter_id THEN
+  RAISE EXCEPTION 'immutable resolution evidence' USING ERRCODE='23514';
+ END IF;
+ IF OLD.status='RECEIVED'::weaverlaw.run_status AND v_actor='wl_resolver' AND NEW.status IN ('VALIDATED'::weaverlaw.run_status,'QUARANTINED'::weaverlaw.run_status) THEN
+  SELECT * INTO STRICT v_inbox FROM weaverlaw.event_inbox i WHERE i.inbox_id=OLD.inbox_id AND i.firm_id=OLD.firm_id;
+  -- Lock exact bound mapping rows through commit, including eligibility and version changes.
+  PERFORM m.verified_matter_id FROM weaverlaw.matter_mapping m
+   WHERE m.firm_id=OLD.firm_id AND m.clio_matter_id::pg_catalog.text IN (SELECT value FROM pg_catalog.jsonb_array_elements_text(v_inbox.matter_signals))
+   ORDER BY m.verified_matter_id FOR SHARE;
+  SELECT COALESCE(pg_catalog.jsonb_agg(m.clio_matter_id::pg_catalog.text ORDER BY m.clio_matter_id::pg_catalog.text),'[]'::pg_catalog.jsonb),
+   COALESCE(pg_catalog.jsonb_object_agg(m.clio_matter_id::pg_catalog.text,m.mapping_version::pg_catalog.text),'{}'::pg_catalog.jsonb),
+   pg_catalog.count(*)::integer INTO v_matches,v_versions,v_count
+   FROM weaverlaw.matter_mapping m WHERE m.firm_id=OLD.firm_id
+    AND m.clio_matter_id::pg_catalog.text IN (SELECT value FROM pg_catalog.jsonb_array_elements_text(v_inbox.matter_signals));
+  IF pg_catalog.jsonb_array_length(v_inbox.matter_signals)=0 OR v_count=0 THEN v_reason:='UNMAPPED_MATTER_SIGNAL';
+  ELSIF v_count<>pg_catalog.jsonb_array_length(v_inbox.matter_signals) OR v_count<>1 THEN v_reason:='CONFLICTING_MATTER_SIGNALS';
+  ELSE
+   SELECT m.verified_matter_id INTO v_matter FROM weaverlaw.matter_mapping m WHERE m.firm_id=OLD.firm_id
+    AND m.clio_matter_id::pg_catalog.text=(v_matches->>0) AND m.eligibility='OPEN';
+   IF v_matter IS NULL THEN v_reason:='MATTER_INELIGIBLE'; ELSE v_reason:='MATTER_VERIFIED'; END IF;
+  END IF;
+  v_target:=CASE WHEN v_matter IS NULL THEN 'QUARANTINED'::weaverlaw.run_status ELSE 'VALIDATED'::weaverlaw.run_status END;
+  IF NEW.status<>v_target OR NEW.verified_matter_id IS DISTINCT FROM v_matter OR NEW.reason_code::pg_catalog.text<>v_reason
+   OR NEW.scope_mode<>(CASE WHEN v_matter IS NULL THEN 'INTAKE_RESTRICTED'::weaverlaw.scope_mode ELSE 'MATTER_VERIFIED'::weaverlaw.scope_mode END) THEN
+   RAISE EXCEPTION 'resolution differs from immutable inbox evidence' USING ERRCODE='23514';
+  END IF;
+  NEW.resolved_matter_id:=v_matter;
+  NEW.resolution_evidence:=pg_catalog.jsonb_build_object(
+   'run_id',NEW.run_id,'inbox_id',OLD.inbox_id,'source_reference',v_inbox.source_ref,'source_version',v_inbox.source_version,
+   'extracted_signals',v_inbox.matter_signals,'matched_clio_ids',v_matches,'mapping_version',v_versions,
+   'decision',v_target,'verified_matter_id',v_matter,'reason_code',v_reason,
+   'envelope_sha256',v_inbox.envelope_sha256,'payload_sha256',v_inbox.payload_sha256,'evidence_sha256',v_inbox.evidence_sha256);
   RETURN NEW;
  END IF;
- IF NEW.verified_matter_id IS DISTINCT FROM OLD.verified_matter_id OR NEW.scope_mode<>OLD.scope_mode THEN RAISE EXCEPTION 'scope change denied'; END IF;
- IF (current_user='wl_worker' AND ((OLD.status='VALIDATED'::weaverlaw.run_status AND NEW.status='RUNNING'::weaverlaw.run_status) OR (OLD.status IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status) AND NEW.status='FAILED'::weaverlaw.run_status) OR (OLD.status IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status) AND NEW.status='CANCELLED'::weaverlaw.run_status)))
- OR (current_user='wl_reviewer' AND OLD.status='RUNNING'::weaverlaw.run_status AND NEW.status='REVIEW_REQUIRED'::weaverlaw.run_status)
- OR (current_user='wl_attorney' AND OLD.status='REVIEW_REQUIRED'::weaverlaw.run_status AND NEW.status='REJECTED'::weaverlaw.run_status) THEN RETURN NEW; END IF;
+ IF current_user='wl_scope_guard' AND NEW.status='QUARANTINED'::weaverlaw.run_status
+  AND OLD.status IN ('RECEIVED'::weaverlaw.run_status,'VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status,'EXECUTING'::weaverlaw.run_status)
+  AND NEW.reason_code IN ('MATTER_INELIGIBLE','CONFLICTING_REPLAY_SIGNALS')
+  AND NEW.scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode AND NEW.verified_matter_id IS NULL THEN RETURN NEW; END IF;
+ IF NEW.verified_matter_id IS DISTINCT FROM OLD.verified_matter_id OR NEW.scope_mode<>OLD.scope_mode
+  OR NEW.resolved_matter_id IS DISTINCT FROM OLD.resolved_matter_id OR NEW.resolution_evidence IS DISTINCT FROM OLD.resolution_evidence THEN
+  RAISE EXCEPTION 'scope change denied' USING ERRCODE='23514';
+ END IF;
+ IF (v_actor='wl_worker' AND ((OLD.status='VALIDATED'::weaverlaw.run_status AND NEW.status='RUNNING'::weaverlaw.run_status) OR (OLD.status IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status) AND NEW.status='FAILED'::weaverlaw.run_status) OR (OLD.status IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status) AND NEW.status='CANCELLED'::weaverlaw.run_status)))
+ OR (v_actor='wl_reviewer' AND OLD.status='RUNNING'::weaverlaw.run_status AND NEW.status='REVIEW_REQUIRED'::weaverlaw.run_status)
+ OR (v_actor='wl_attorney' AND OLD.status='REVIEW_REQUIRED'::weaverlaw.run_status AND NEW.status='REJECTED'::weaverlaw.run_status) THEN
+  IF NOT weaverlaw.lock_mapping_is_open(OLD.firm_id,OLD.verified_matter_id) THEN RAISE EXCEPTION 'mapping no longer eligible' USING ERRCODE='42501'; END IF;
+  RETURN NEW;
+ END IF;
  RAISE EXCEPTION 'illegal or disabled transition' USING ERRCODE='23514';
 END $$;
 CREATE TRIGGER run_edge BEFORE UPDATE ON weaverlaw.workflow_run FOR EACH ROW EXECUTE FUNCTION weaverlaw.enforce_run_edge();
@@ -206,4 +312,85 @@ END $$;
 CREATE TRIGGER run_audit AFTER INSERT OR UPDATE ON weaverlaw.workflow_run FOR EACH ROW EXECUTE FUNCTION weaverlaw.audit_run_edge();
 ALTER FUNCTION weaverlaw.audit_run_edge() OWNER TO wl_audit_writer;
 REVOKE ALL ON FUNCTION weaverlaw.audit_run_edge() FROM PUBLIC;
+-- Terminal conflicting deliveries are audit anomalies, never terminal-state rewrites.
+CREATE FUNCTION weaverlaw.append_replay_anomaly(p_firm uuid,p_run uuid,p_scope weaverlaw.scope_mode,p_matter uuid,p_status weaverlaw.run_status)
+ RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE v_actor text := COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user);
+BEGIN
+ IF p_firm IS DISTINCT FROM weaverlaw.context_firm() OR v_actor<>'wl_intake' THEN
+  RAISE EXCEPTION 'unauthorized replay audit' USING ERRCODE='42501';
+ END IF;
+ INSERT INTO weaverlaw.audit_event(firm_id,run_id,scope_mode,verified_matter_id,old_status,new_status,actor,reason_code)
+ VALUES(p_firm,p_run,p_scope,p_matter,p_status,p_status,v_actor,'CONFLICTING_REPLAY_SIGNALS');
+END $$;
+ALTER FUNCTION weaverlaw.append_replay_anomaly(uuid,uuid,weaverlaw.scope_mode,uuid,weaverlaw.run_status) OWNER TO wl_audit_writer;
+REVOKE ALL ON FUNCTION weaverlaw.append_replay_anomaly(uuid,uuid,weaverlaw.scope_mode,uuid,weaverlaw.run_status) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION weaverlaw.append_replay_anomaly(uuid,uuid,weaverlaw.scope_mode,uuid,weaverlaw.run_status) TO wl_scope_guard;
+
+-- Only immutable intake evidence is compared; this helper never exposes promoted rows.
+CREATE FUNCTION weaverlaw.check_replay(p_firm uuid,p_inbox uuid,p_signals jsonb,p_envelope_sha256 text,p_payload_sha256 text,p_evidence_sha256 text)
+ RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+ v_actor text := COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user);
+ v_inbox weaverlaw.event_inbox%ROWTYPE; v_run weaverlaw.workflow_run%ROWTYPE;
+BEGIN
+ IF v_actor<>'wl_intake' OR p_firm IS DISTINCT FROM weaverlaw.context_firm() THEN
+  RAISE EXCEPTION 'unauthorized replay check' USING ERRCODE='42501';
+ END IF;
+ SELECT * INTO v_inbox FROM weaverlaw.event_inbox i WHERE i.inbox_id=p_inbox AND i.firm_id=p_firm;
+ IF NOT FOUND THEN RAISE EXCEPTION 'missing or unauthorized inbox' USING ERRCODE='42501'; END IF;
+ SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.inbox_id=p_inbox AND r.firm_id=p_firm;
+ IF NOT FOUND THEN RAISE EXCEPTION 'missing or unauthorized run' USING ERRCODE='42501'; END IF;
+ -- Lock mapping first, then run, consistently with resolution and revalidation.
+ PERFORM m.verified_matter_id FROM weaverlaw.matter_mapping m
+  WHERE m.firm_id=p_firm AND m.verified_matter_id=v_run.resolved_matter_id FOR SHARE;
+ SELECT * INTO STRICT v_run FROM weaverlaw.workflow_run r WHERE r.run_id=v_run.run_id AND r.firm_id=p_firm FOR UPDATE;
+ IF v_inbox.matter_signals IS DISTINCT FROM weaverlaw.canonical_signals(p_signals)
+  OR v_inbox.envelope_sha256::pg_catalog.text IS DISTINCT FROM p_envelope_sha256
+  OR v_inbox.payload_sha256::pg_catalog.text IS DISTINCT FROM p_payload_sha256
+  OR v_inbox.evidence_sha256::pg_catalog.text IS DISTINCT FROM p_evidence_sha256 THEN
+  IF v_run.status IN ('RECEIVED'::weaverlaw.run_status,'VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status,'EXECUTING'::weaverlaw.run_status) THEN
+   UPDATE weaverlaw.workflow_run SET status='QUARANTINED'::weaverlaw.run_status,reason_code='CONFLICTING_REPLAY_SIGNALS',
+    scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode,verified_matter_id=NULL WHERE run_id=v_run.run_id AND firm_id=p_firm;
+  ELSE
+   PERFORM weaverlaw.append_replay_anomaly(p_firm,v_run.run_id,v_run.scope_mode,v_run.verified_matter_id,v_run.status);
+  END IF;
+ END IF;
+ RETURN v_run.run_id;
+END $$;
+ALTER FUNCTION weaverlaw.check_replay(uuid,uuid,jsonb,text,text,text) OWNER TO wl_scope_guard;
+REVOKE ALL ON FUNCTION weaverlaw.check_replay(uuid,uuid,jsonb,text,text,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION weaverlaw.check_replay(uuid,uuid,jsonb,text,text,text) TO wl_intake;
+
+-- Caller commits a false result, then surfaces Denied; quarantine must survive denial.
+CREATE FUNCTION weaverlaw.revalidate_run(p_firm uuid,p_run uuid,p_matter uuid)
+ RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+ v_actor text := COALESCE(NULLIF(NULLIF(pg_catalog.current_setting('role',true),''),'none'),session_user);
+ v_run weaverlaw.workflow_run%ROWTYPE; v_open boolean := false;
+BEGIN
+ IF v_actor NOT IN ('wl_resolver','wl_worker','wl_reviewer','wl_attorney')
+  OR p_firm IS DISTINCT FROM weaverlaw.context_firm() OR p_matter IS NULL
+  OR p_matter IS DISTINCT FROM weaverlaw.context_matter() THEN
+  RAISE EXCEPTION 'unauthorized revalidation' USING ERRCODE='42501';
+ END IF;
+ SELECT * INTO v_run FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.firm_id=p_firm;
+ IF NOT FOUND OR v_run.resolved_matter_id IS DISTINCT FROM p_matter THEN
+  RAISE EXCEPTION 'missing or unauthorized run' USING ERRCODE='42501';
+ END IF;
+ SELECT m.eligibility='OPEN' INTO v_open FROM weaverlaw.matter_mapping m
+  WHERE m.firm_id=p_firm AND m.verified_matter_id=p_matter FOR SHARE;
+ SELECT * INTO STRICT v_run FROM weaverlaw.workflow_run r WHERE r.run_id=p_run AND r.firm_id=p_firm FOR UPDATE;
+ IF v_run.status NOT IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status,'EXECUTING'::weaverlaw.run_status) THEN RETURN false; END IF;
+ IF v_run.scope_mode<>'MATTER_VERIFIED'::weaverlaw.scope_mode OR v_run.verified_matter_id IS DISTINCT FROM p_matter THEN RETURN false; END IF;
+ IF COALESCE(v_open,false) THEN RETURN true; END IF;
+ IF v_run.status IN ('VALIDATED'::weaverlaw.run_status,'RUNNING'::weaverlaw.run_status,'REVIEW_REQUIRED'::weaverlaw.run_status,'APPROVED'::weaverlaw.run_status,'EXECUTING'::weaverlaw.run_status) THEN
+  UPDATE weaverlaw.workflow_run SET status='QUARANTINED'::weaverlaw.run_status,reason_code='MATTER_INELIGIBLE',
+   scope_mode='INTAKE_RESTRICTED'::weaverlaw.scope_mode,verified_matter_id=NULL WHERE run_id=p_run AND firm_id=p_firm;
+ END IF;
+ RETURN false;
+END $$;
+ALTER FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) OWNER TO wl_scope_guard;
+REVOKE ALL ON FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION weaverlaw.revalidate_run(uuid,uuid,uuid) TO wl_resolver,wl_worker,wl_reviewer,wl_attorney;
 COMMIT;

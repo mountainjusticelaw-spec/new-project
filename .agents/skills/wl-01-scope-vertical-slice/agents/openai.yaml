@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-01 Scope the vertical slice"
+  short_description: "Keep correspondence-control changes within the authorized PR1"
+  default_prompt: "Use $wl-01-scope-vertical-slice to scope this correspondence-control change and identify its verification gates."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-08 Audit and RLS isolation"
+  short_description: "Verify forced row isolation, immutable evidence, and isolated"
+  default_prompt: "Use $wl-08-audit-rls-isolation to inspect PostgreSQL role isolation, immutable evidence, and append-only audit behavior."

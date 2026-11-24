@@ -45,6 +45,9 @@ def test_replay():
     run, created = intake.accept(a, ['clio-001'])
     again, repeated = intake.accept(b, ['clio-002'])
     assert created and not repeated and again is run and len(intake.outbox) == 1
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.audit[-1].reason == 'CONFLICTING_REPLAY_SIGNALS'
+    assert run.resolved_matter_id == MATTER
 
 
 @pytest.mark.parametrize('signals,reason', [([], 'UNMAPPED_MATTER_SIGNAL'),
@@ -302,3 +305,197 @@ def test_execute_accepts_single_use_source_versions_iterator():
         NOW, permitted=True, enabled=True,
     )
     assert run.status == State.COMPLETED and len(exe.effects) == 1
+
+
+def test_ingest_binds_resolution_to_immutable_signals_and_source_evidence():
+    signals = ['clio-001']
+    intake = Intake(resolver())
+    run, created = intake.ingest_event(event(), signals, payload_sha256='a' * 64)
+    signals.append('clio-002')
+    assert created and run.status == State.RECEIVED
+    assert run.intake_evidence['matter_signals'] == ('clio-001',)
+    before = tuple(run.audit)
+    with pytest.raises(Denied):
+        intake.resolve_run(run, trusted_signals=['clio-002'])
+    assert run.status == State.RECEIVED and tuple(run.audit) == before
+    assert run.resolution_evidence is None
+
+    assert intake.resolve_run(run) == (State.VALIDATED, MATTER, 'MATTER_VERIFIED')
+    evidence = run.resolution_evidence
+    assert evidence['run_id'] == str(run.run_id)
+    assert evidence['inbox_id'] == run.intake_evidence['inbox_id']
+    assert evidence['source_reference'] == 'synthetic-message-001'
+    assert evidence['source_version'] == 'v1'
+    assert evidence['extracted_signals'] == ('clio-001',)
+    assert evidence['matched_clio_ids'] == ('clio-001',)
+    assert evidence['mapping_version'] == {'clio-001': 'v1'}
+    assert (evidence['decision'], evidence['reason_code']) == ('VALIDATED', 'MATTER_VERIFIED')
+    with pytest.raises(TypeError):
+        run.intake_evidence['matter_signals'] = ('clio-002',)
+    with pytest.raises(TypeError):
+        evidence['source_version'] = 'v2'
+    with pytest.raises(TypeError):
+        evidence['mapping_version']['clio-001'] = 'v2'
+    with pytest.raises(AttributeError):
+        run.resolution_evidence = {}
+
+
+@pytest.mark.parametrize('eligibility', ['RESTRICTED', 'CLOSED'])
+def test_restricted_mapping_after_validation_quarantines_before_start(eligibility):
+    from dataclasses import replace
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    evidence = run.resolution_evidence
+    intake.resolver.mappings = tuple(
+        replace(mapping, eligibility=eligibility, mapping_version='v2')
+        if mapping.matter_id == MATTER else mapping
+        for mapping in intake.resolver.mappings
+    )
+    with pytest.raises(Denied):
+        intake.start(run, NOW)
+    assert run.status == State.QUARANTINED and run.scope_mode == 'INTAKE_RESTRICTED'
+    assert run.matter_id is None and run.resolved_matter_id == MATTER
+    assert run.audit[-1].reason == 'MATTER_INELIGIBLE'
+    assert run.resolution_evidence is evidence
+    assert not intake.steps and not intake.agent_calls
+
+
+def test_running_run_revalidation_preserves_original_resolution_and_blocks_review():
+    from dataclasses import replace
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    intake.start(run, NOW)
+    evidence = run.resolution_evidence
+    intake.resolver.mappings = tuple(
+        replace(mapping, eligibility='RESTRICTED') if mapping.matter_id == MATTER else mapping
+        for mapping in intake.resolver.mappings
+    )
+    assert intake.revalidate_run(run, NOW) is False
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.resolved_matter_id == MATTER and run.resolution_evidence is evidence
+    before = tuple(run.audit)
+    with pytest.raises(Denied):
+        intake.review(run, NOW, independently_checked=True)
+    assert tuple(run.audit) == before and len(intake.agent_calls) == 1
+
+
+@pytest.mark.parametrize('phase', ['review', 'approve', 'execute'])
+def test_revocation_blocks_every_later_processing_gate(phase):
+    from dataclasses import replace
+    from services.correspondence.core import Approval, MockPolicyExecutor, Proposal
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    intake.start(run, NOW)
+    if phase != 'review':
+        intake.review(run, NOW, independently_checked=True)
+    p = Proposal(run.run_id,MATTER,FIRM,'mock.review','synthetic-sink','draft-only',
+                 (('synthetic-message-001','v1'),),'p1')
+    a = Approval(run.run_id,FIRM,MATTER,UUID(int=10),p.action_digest,
+                 p.destination,p.policy_version,NOW+timedelta(minutes=5))
+    exe = MockPolicyExecutor()
+    if phase == 'execute':
+        exe.approve(run,p,a,p.source_versions,NOW,permitted=True)
+    intake.resolver.mappings = tuple(
+        replace(mapping, eligibility='RESTRICTED') if mapping.matter_id == MATTER else mapping
+        for mapping in intake.resolver.mappings
+    )
+    with pytest.raises(Denied):
+        if phase == 'review':
+            intake.review(run,NOW,independently_checked=True)
+        elif phase == 'approve':
+            exe.approve(run,p,a,p.source_versions,NOW,permitted=True)
+        else:
+            exe.execute(run,p,a,p.source_versions,NOW,permitted=True,enabled=True)
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.audit[-1].reason == 'MATTER_INELIGIBLE' and not exe.effects
+
+
+def test_replayed_delivery_metadata_and_signal_order_do_not_change_evidence():
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001', 'clio-001'], payload_sha256='a' * 64)
+    before = tuple(run.audit)
+    duplicate = event(event_id=UUID(int=99),correlation_id=UUID(int=98),
+                      received_at=NOW+timedelta(seconds=1))
+    same, created = intake.accept(duplicate,iter(['clio-001']),payload_sha256='a' * 64)
+    assert same is run and not created and run.status == State.VALIDATED
+    assert tuple(run.audit) == before and len(intake.runs) == len(intake.outbox) == 1
+
+
+@pytest.mark.parametrize('contradiction', ['signals', 'additional_signal', 'payload', 'source_time'])
+def test_conflicting_replay_quarantines_without_new_run_or_specialist(contradiction):
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'], payload_sha256='a' * 64)
+    duplicate = event()
+    signals, payload_sha256 = ['clio-001'], 'a' * 64
+    if contradiction == 'signals': signals = ['clio-002']
+    if contradiction == 'additional_signal': signals.append('unknown')
+    if contradiction == 'payload': payload_sha256 = 'b' * 64
+    if contradiction == 'source_time': duplicate = event(occurred_at=NOW-timedelta(seconds=1))
+    same, created = intake.accept(duplicate,signals,payload_sha256=payload_sha256)
+    assert same is run and not created
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.audit[-1].reason == 'CONFLICTING_REPLAY_SIGNALS'
+    assert run.intake_evidence['matter_signals'] == ('clio-001',)
+    assert run.intake_evidence['payload_sha256'] == 'a' * 64
+    assert len(intake.runs) == len(intake.outbox) == 1 and not intake.agent_calls
+
+
+def test_terminal_conflicting_replay_records_anomaly_without_rewriting_terminal_state():
+    run,p,a,exe = approved_fixture()
+    exe.execute(run,p,a,p.source_versions,NOW,permitted=True,enabled=True)
+    before = (run.status,run.matter_id,run.resolution_evidence,run.accepted_approval)
+    audit_count = len(run.audit)
+    same, created = run._intake.accept(event(), ['clio-002'])
+    assert same is run and not created
+    assert (run.status,run.matter_id,run.resolution_evidence,run.accepted_approval) == before
+    assert len(run.audit) == audit_count + 1
+    assert run.audit[-1].reason == 'CONFLICTING_REPLAY_SIGNALS'
+    assert len(exe.effects) == 1 and len(run._intake.outbox) == 1
+
+
+def test_reassigned_mapping_and_detached_run_cannot_resume_scoped_processing():
+    from dataclasses import replace
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    detached = replace(run)
+    with pytest.raises(Denied):
+        detached.move(State.VALIDATED,State.RUNNING,Actor.COORDINATOR,NOW,'START')
+    assert detached.status == State.VALIDATED and run.status == State.VALIDATED
+    intake.resolver.mappings = tuple(
+        replace(mapping,matter_id=OTHER) if mapping.clio_id == 'clio-001' else mapping
+        for mapping in intake.resolver.mappings
+    )
+    with pytest.raises(Denied):
+        intake.start(run,NOW)
+    assert run.status == State.QUARANTINED and run.resolved_matter_id == MATTER
+
+
+def test_reassigning_registered_run_identity_cannot_reuse_bound_evidence():
+    intake = Intake(Resolver([Mapping(FIRM,MATTER,'clio-001'),Mapping(OTHER,MATTER,'clio-001')]))
+    run, _ = intake.accept(event(), ['clio-001'])
+    run.firm_id = OTHER
+    before = tuple(run.audit)
+    with pytest.raises(Denied):
+        intake.start(run,NOW)
+    assert run.status == State.VALIDATED and tuple(run.audit) == before
+    assert not intake.steps and not intake.agent_calls
+
+
+@pytest.mark.parametrize('target', [State.CANCELLED,State.FAILED,State.REJECTED])
+def test_revoked_matter_cannot_take_another_scoped_terminal_transition(target):
+    from dataclasses import replace
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    actor = Actor.COORDINATOR
+    if target == State.REJECTED:
+        intake.start(run,NOW)
+        intake.review(run,NOW,independently_checked=True)
+        actor = Actor.ATTORNEY
+    intake.resolver.mappings = tuple(
+        replace(mapping,eligibility='CLOSED') if mapping.matter_id == MATTER else mapping
+        for mapping in intake.resolver.mappings
+    )
+    with pytest.raises(Denied):
+        run.move(run.status,target,actor,NOW,'STOP')
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.audit[-1].reason == 'MATTER_INELIGIBLE'

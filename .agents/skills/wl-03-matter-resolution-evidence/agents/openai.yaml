@@ -1,0 +1,4 @@
+interface:
+  display_name: "WL-03 Evidence-bound matter resolution"
+  short_description: "Resolve exact trusted matter signals from immutable inbox"
+  default_prompt: "Use $wl-03-matter-resolution-evidence to verify immutable resolution evidence and current matter eligibility."
