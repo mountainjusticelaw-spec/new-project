@@ -87,6 +87,44 @@ def test_happy_and_invalid_transitions():
     assert len(intake.steps) == 1 and len(intake.agent_calls) == 1
 
 
+def test_undefined_transition_raises_denied_when_actor_is_none():
+    from services.correspondence.core import Audit, Run, check_edge
+
+    for source, target in (
+        (State.RUNNING, State.APPROVED),
+        (State.RECEIVED, State.COMPLETED),
+        (State.RUNNING, State.RECEIVED),
+    ):
+        run = Run(
+            firm_id=FIRM, status=source,
+            matter_id=None if source == State.RECEIVED else MATTER,
+            audit=[Audit(source, Actor.INGRESS, 'SYNTHETIC_BEFORE', NOW)],
+        )
+        before = (run.status, run.matter_id, tuple(run.audit), run.accepted_approval)
+        with pytest.raises(Denied):
+            run.move(source, target, None, NOW, 'INVALID')
+        with pytest.raises(Denied):
+            run._move(source, target, None, NOW, 'INVALID', mock=True)
+        assert (run.status, run.matter_id, tuple(run.audit), run.accepted_approval) == before
+
+        # Bypass reserved-state restrictions to exercise the edge lookup itself.
+        with pytest.raises(Denied):
+            check_edge(source, target, None, MATTER, 'INVALID', mock=True)
+
+
+def test_defined_transition_raises_denied_when_actor_is_none_or_empty():
+    from services.correspondence.core import check_edge
+
+    run, _ = Intake(resolver()).accept(event(), ['clio-001'])
+    before = (run.status, run.matter_id, tuple(run.audit), run.accepted_approval)
+    for actor in (None, '', False, 0, 1, object()):
+        with pytest.raises(Denied):
+            check_edge(State.VALIDATED, State.RUNNING, actor, MATTER, 'INVALID')
+        with pytest.raises(Denied):
+            run.move(State.VALIDATED, State.RUNNING, actor, NOW, 'INVALID')
+        assert (run.status, run.matter_id, tuple(run.audit), run.accepted_approval) == before
+
+
 def test_review_requires_independent_check():
     intake = Intake(resolver())
     run, _ = intake.accept(event(), ['clio-001'])

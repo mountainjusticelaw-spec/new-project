@@ -145,7 +145,12 @@ QUARANTINE_REASONS = {'UNMAPPED_MATTER_SIGNAL','CONFLICTING_MATTER_SIGNALS','MAT
 
 
 def check_edge(expected, target, actor, matter_id, reason, *, mock=False):
-    if (target in RESERVED and not mock) or EDGES.get((expected,target)) != actor:
+    if not actor or not isinstance(actor, str):
+        raise Denied('actor required')
+    edge = (expected, target)
+    if edge not in EDGES:
+        raise Denied('undefined transition')
+    if (target in RESERVED and not mock) or EDGES[edge] != actor:
         raise Denied('transition not authorized in PR1')
     if target == State.QUARANTINED:
         if matter_id is not None or reason not in QUARANTINE_REASONS:
