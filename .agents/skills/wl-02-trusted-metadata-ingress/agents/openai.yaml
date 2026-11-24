@@ -1,4 +1,0 @@
-interface:
-  display_name: "WL-02 Trusted metadata ingress"
-  short_description: "Validate metadata-only synthetic ingress and bind canonical"
-  default_prompt: "Use $wl-02-trusted-metadata-ingress to review or implement evidence-bound synthetic event acceptance."

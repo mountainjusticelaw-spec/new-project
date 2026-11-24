@@ -1,10 +1,15 @@
 """DB adapter unit tests, not a substitute for actual PostgreSQL RLS tests."""
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID
+
 import pytest
+
 from services.correspondence.core import Actor, Denied, Envelope, State, intake_evidence
 from services.correspondence.postgres import receive, resolve_run, transition
+
+DEFAULT_FIRM = UUID(int=1)
 
 
 class FakeConnection:
@@ -37,9 +42,8 @@ class FakeConnection:
         return list(self.rows)
 
 
-def sample_envelope(firm_id=UUID(int=1)):
-    from datetime import datetime, timezone
-    now = datetime(2026, 11, 23, 14, tzinfo=timezone.utc)
+def sample_envelope(firm_id=DEFAULT_FIRM):
+    now = datetime(2026, 11, 23, 14, tzinfo=UTC)
     return Envelope(
         schema_version=1,
         event_id=UUID(int=4),

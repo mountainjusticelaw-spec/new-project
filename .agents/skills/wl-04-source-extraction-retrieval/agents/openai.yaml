@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-04: Source-Referenced Extraction, Coordinates & Scoped Postgres Retrieval"
+  short_description: "Manages minimal-copy source_reference provenance, Dropbox/Gmail version pinning, normalized top-left bounding boxes, Bates/line spans, and pre-filtered PostgreSQL retrieval."
+  default_prompt: "Use $wl-04-source-extraction-retrieval to apply WL-04: Source-Referenced Extraction, Coordinates & Scoped Postgres Retrieval controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true

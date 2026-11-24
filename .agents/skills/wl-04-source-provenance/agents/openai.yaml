@@ -1,4 +1,0 @@
-interface:
-  display_name: "WL-04 Source provenance"
-  short_description: "Preserve immutable source references, versions, and evidence"
-  default_prompt: "Use $wl-04-source-provenance to check source identity, version binding, and evidence immutability."

@@ -2,7 +2,7 @@
 
 This contract covers the local deterministic slice and the F-01, F-02, and F-05 control repairs. [Architecture decisions](../../docs/DECISIONS.md) lock the future stack to Google ADK + Gemini + Cloud SQL for PostgreSQL. PR1 does not invoke ADK or Gemini, connect live provider adapters, provision resources, enable billing or IAM, deploy, send communications, alter official records, or process client data. [Governance](../../docs/GOVERNANCE.md), [security policy](../../SECURITY.md), and [AGENTS.md](../../AGENTS.md) retain their authority.
 
-The ten checked-in [workspace skills](../../skills/README.md) implement the repository contracts. They are repository-authored guidance, not a claimed verbatim reproduction of an unavailable owner document. WL-01 scopes the slice; WL-03, WL-05, WL-08, WL-09, and WL-10 cover evidence-bound identity, deterministic state, isolation, replay, and verification.
+The ten checked-in [workspace skills](../../skills/README.md) (`WL-01..WL-10`) record the WeaverLawOS skill controls across the roadmap. `WL-01` (`wl-01-scope-vertical-slice`), `WL-03` (`wl-03-rls-digest-security`), `WL-05` (`wl-05-state-machine-adk-harness`), and `WL-10` (`wl-10-synthetic-fixtures-gates`) govern PR1 scoping, RLS/action-digest/evidence security, deterministic state/replay orchestration, and synthetic plus live-PostgreSQL verification gates; `WL-02`, `WL-04`, `WL-06`, `WL-07`, `WL-08`, and `WL-09` define downstream legal, extraction, citation-audit, UI, OOXML, and adapter controls that remain inactive in PR1.
 
 ## Acceptance contract
 

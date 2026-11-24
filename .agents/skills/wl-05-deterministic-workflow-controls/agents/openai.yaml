@@ -1,4 +1,0 @@
-interface:
-  display_name: "WL-05 Deterministic workflow controls"
-  short_description: "Enforce explicit actor/state edges, current matter scope, and"
-  default_prompt: "Use $wl-05-deterministic-workflow-controls to review explicit state transitions and fail-closed authorization."

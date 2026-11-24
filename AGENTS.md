@@ -20,18 +20,18 @@ The locked implementation direction is Google ADK + Gemini + Cloud SQL for Postg
 
 Use repository skills when their control is relevant to the current authorized task. Each has a `SKILL.md` and `agents/openai.yaml`; the full index is [skills/README.md](skills/README.md).
 
-- [WL-01 Scope the vertical slice](.agents/skills/wl-01-scope-vertical-slice/SKILL.md).
-- [WL-02 Trusted metadata ingress](.agents/skills/wl-02-trusted-metadata-ingress/SKILL.md).
-- [WL-03 Evidence-bound matter resolution](.agents/skills/wl-03-matter-resolution-evidence/SKILL.md).
-- [WL-04 Source provenance](.agents/skills/wl-04-source-provenance/SKILL.md).
-- [WL-05 Deterministic workflow controls](.agents/skills/wl-05-deterministic-workflow-controls/SKILL.md).
-- [WL-06 Independent review](.agents/skills/wl-06-independent-review/SKILL.md).
-- [WL-07 Exact-action approvals](.agents/skills/wl-07-exact-action-approvals/SKILL.md).
-- [WL-08 Audit and RLS isolation](.agents/skills/wl-08-audit-rls-isolation/SKILL.md).
-- [WL-09 Replay and recovery](.agents/skills/wl-09-replay-recovery/SKILL.md).
-- [WL-10 Synthetic fixtures and gates](.agents/skills/wl-10-synthetic-fixtures-gates/SKILL.md).
+- [WL-01: Scope & Staged Vertical-Slice Execution](.agents/skills/wl-01-scope-vertical-slice/SKILL.md).
+- [WL-02: Georgia Law, Deadlines & GRPC Compliance](.agents/skills/wl-02-georgia-law-grpc/SKILL.md).
+- [WL-03: Cloud SQL RLS, Action-Digest Approvals & Security Controls](.agents/skills/wl-03-rls-digest-security/SKILL.md).
+- [WL-04: Source-Referenced Extraction, Coordinates & Scoped Postgres Retrieval](.agents/skills/wl-04-source-extraction-retrieval/SKILL.md).
+- [WL-05: Python State Machine, Transactional Outbox & ADK Specialist Harness](.agents/skills/wl-05-state-machine-adk-harness/SKILL.md).
+- [WL-06: Deterministic Citation, Quote & Provenance Auditor (Independent Review)](.agents/skills/wl-06-citation-provenance-auditor/SKILL.md).
+- [WL-07: Attorney Command Center UI (Next.js / TypeScript)](.agents/skills/wl-07-attorney-command-center-ui/SKILL.md).
+- [WL-08: Reversible .docx OOXML Redline & Work-Product Compiler](.agents/skills/wl-08-docx-ooxml-redline-compiler/SKILL.md).
+- [WL-09: Authorized External Adapters (Clio, Dropbox, Gmail, Primary Law)](.agents/skills/wl-09-authorized-external-adapters/SKILL.md).
+- [WL-10: Synthetic Fixtures, Negative-Path Tests & Release Gates](.agents/skills/wl-10-synthetic-fixtures-gates/SKILL.md).
 
-These repository-authored skills do not add authority beyond the user's instructions, repository policy, or attorney approval. Keep them aligned with the executable contracts and actual verification results.
+These workspace skills do not add authority beyond the user's instructions, repository policy, or attorney approval. Keep them aligned with the executable contracts and actual verification results.
 
 ## Definition of done
 Relevant tests (including negative paths) pass or limitations are disclosed; documentation matches behavior; no secrets or live data; approval boundaries and provenance preserved; reviewed rollback and recovery plan for any operational change. This file does not override platform policies or attorney authorization.

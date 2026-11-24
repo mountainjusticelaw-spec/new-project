@@ -1,16 +1,25 @@
 """Synthetic-only control layer. No provider clients or network effects."""
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import StrEnum
-from hashlib import sha256
 import json
 import re
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+from hashlib import sha256
 from types import MappingProxyType
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
-from pydantic import BaseModel, ConfigDict, StringConstraints, computed_field, field_validator, model_validator
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StringConstraints,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 Opaque = Annotated[str, StringConstraints(pattern=r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$')]
+
 
 class Envelope(BaseModel):
     model_config = ConfigDict(extra='forbid', frozen=True)
@@ -30,7 +39,7 @@ class Envelope(BaseModel):
     @classmethod
     def timestamp_type(cls, value):
         if not isinstance(value, (datetime, str)):
-            raise ValueError('timestamp must be an ISO-8601 string or datetime')
+            raise ValueError('timestamp must be an ISO-8601 string or datetime')  # noqa: TRY004
         return value
 
     @field_validator('event_id', 'firm_id', 'correlation_id')
@@ -52,7 +61,7 @@ class Envelope(BaseModel):
     def utc(cls, value):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError('timezone required')
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
     @model_validator(mode='after')
     def order(self):
@@ -285,10 +294,15 @@ class Run:
     matter_id: UUID | None = None
     audit: list[Audit] = field(default_factory=list)
     accepted_approval: AcceptedApproval | None = None
+    _independently_checked: bool = field(default=False, repr=False)
     _intake: object = field(default=None, repr=False, compare=False)
     _intake_evidence: object = field(default=None, repr=False)
     _resolution_evidence: object = field(default=None, repr=False)
     _resolved_matter_id: UUID | None = field(default=None, repr=False)
+
+    @property
+    def independently_checked(self) -> bool:
+        return self._independently_checked
 
     @property
     def intake_evidence(self):
@@ -310,16 +324,30 @@ class Run:
     def scope_mode(self):
         return 'MATTER_VERIFIED' if self.matter_id else 'INTAKE_RESTRICTED'
 
-    def move(self, expected, target, actor, now, reason, *, resolved_matter=None):
-        self._move(expected,target,actor,now,reason,resolved_matter=resolved_matter)
+    def move(self, expected, target, actor, now, reason, *, resolved_matter=None, independently_checked=False):
+        self._move(
+            expected, target, actor, now, reason,
+            resolved_matter=resolved_matter,
+            independently_checked=independently_checked,
+        )
 
-    def _move(self, expected, target, actor, now, reason, *, resolved_matter=None, mock=False, accepted_approval=None):
+    def _move(
+        self, expected, target, actor, now, reason, *,
+        resolved_matter=None, mock=False, accepted_approval=None, independently_checked=False,
+    ):
         if self.status != expected:
             raise Denied('stale status')
         if resolved_matter is not None and (expected,target,actor) != (State.RECEIVED,State.VALIDATED,Actor.RESOLVER):
             raise Denied('scope change denied')
-        if target == State.APPROVED and accepted_approval is None:
-            raise Denied('accepted approval record required')
+        if target == State.REVIEW_REQUIRED and independently_checked is not True:
+            raise Denied('independent review required')
+        if independently_checked is not False and (
+            independently_checked is not True
+            or (expected,target,actor) != (State.RUNNING,State.REVIEW_REQUIRED,Actor.INDEPENDENT_REVIEW)
+        ):
+            raise Denied('independent review binding denied')
+        if target == State.APPROVED and (accepted_approval is None or self._independently_checked is not True):
+            raise Denied('accepted approval and independent review required')
         if accepted_approval is not None and (
             (expected,target,actor,mock) != (State.REVIEW_REQUIRED,State.APPROVED,Actor.ATTORNEY,True)
             or self.accepted_approval is not None
@@ -332,6 +360,10 @@ class Run:
         if self.matter_id is not None and target != State.QUARANTINED:
             self._require_eligibility(now)
         self.matter_id, self.status = matter, target
+        if target == State.REVIEW_REQUIRED:
+            self._independently_checked = True
+        elif target == State.QUARANTINED:
+            self._independently_checked = False
         if accepted_approval is not None:
             self.accepted_approval = accepted_approval
         self.audit.append(Audit(target,actor,reason,now))
@@ -433,9 +465,10 @@ class Intake:
 
     def review(self, run, now, *, independently_checked):
         self._owned(run)
-        if independently_checked is not True:
-            raise Denied('independent review required')
-        run.move(State.RUNNING,State.REVIEW_REQUIRED,Actor.INDEPENDENT_REVIEW,now,'SYNTHETIC_REVIEW')
+        run.move(
+            State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW,
+            now, 'SYNTHETIC_REVIEW', independently_checked=independently_checked,
+        )
 
 
 class MockPolicyExecutor:
@@ -447,6 +480,7 @@ class MockPolicyExecutor:
 
     def _check(self, run, p, a, versions, now, permitted, enabled):
         if (permitted is not True or enabled is not True or a.revoked is not False
+            or run.independently_checked is not True
             or not p.proposal_id.int or not a.approval_id.int or not a.reviewer_id.int
             or a.proposal_id not in (None, p.proposal_id)
             or now is None or a.expires_at.tzinfo is None or a.expires_at.utcoffset() is None

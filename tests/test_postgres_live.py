@@ -25,7 +25,10 @@ import pytest
 
 from services.correspondence.core import Actor, Denied, Envelope, State
 from services.correspondence.postgres import (
-    receive, resolve_run, revalidate_matter_eligibility, transition,
+    receive,
+    resolve_run,
+    revalidate_matter_eligibility,
+    transition,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

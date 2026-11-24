@@ -1,0 +1,6 @@
+interface:
+  display_name: "WL-03: Cloud SQL RLS, Action-Digest Approvals & Security Controls"
+  short_description: "Enforces PostgreSQL FORCE ROW LEVEL SECURITY, restricted NOBYPASSRLS roles, intake vs. verified matter isolation, SHA-256 action-digest approvals, and untrusted content sandboxing."
+  default_prompt: "Use $wl-03-rls-digest-security to apply WL-03: Cloud SQL RLS, Action-Digest Approvals & Security Controls controls within the authorized task scope."
+policy:
+  allow_implicit_invocation: true
