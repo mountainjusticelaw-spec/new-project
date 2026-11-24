@@ -1,10 +1,12 @@
 """Synthetic-only control layer. No provider clients or network effects."""
 import json
 import re
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
+from itertools import islice
 from types import MappingProxyType
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
@@ -12,6 +14,8 @@ from uuid import UUID, uuid4
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
+    StrictInt,
     StringConstraints,
     computed_field,
     field_validator,
@@ -19,11 +23,18 @@ from pydantic import (
 )
 
 Opaque = Annotated[str, StringConstraints(pattern=r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$')]
+MAX_SIGNALS = 32
+MAX_SIGNAL_ITEMS = 1024
+MAX_REPLAY_CONFLICT_DIGESTS = 8
+ISO_TIMESTAMP = re.compile(
+    r'\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}'
+    r'(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})'
+)
 
 
 class Envelope(BaseModel):
     model_config = ConfigDict(extra='forbid', frozen=True)
-    schema_version: Literal[1]
+    schema_version: Annotated[StrictInt, Field(ge=1, le=1)]
     event_id: UUID
     source: Literal['synthetic.gmail']
     event_type: Literal['correspondence.received']
@@ -40,6 +51,8 @@ class Envelope(BaseModel):
     def timestamp_type(cls, value):
         if not isinstance(value, (datetime, str)):
             raise ValueError('timestamp must be an ISO-8601 string or datetime')  # noqa: TRY004
+        if isinstance(value, str) and ISO_TIMESTAMP.fullmatch(value) is None:
+            raise ValueError('timezone-qualified ISO-8601 timestamp required')
         return value
 
     @field_validator('event_id', 'firm_id', 'correlation_id')
@@ -59,9 +72,12 @@ class Envelope(BaseModel):
     @field_validator('occurred_at', 'received_at')
     @classmethod
     def utc(cls, value):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError('timezone required')
-        return value.astimezone(UTC)
+        try:
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError('timezone required')
+            return value.astimezone(UTC)
+        except (OverflowError, TypeError, ValueError) as err:
+            raise ValueError('timestamp must fit the UTC datetime range') from err
 
     @model_validator(mode='after')
     def order(self):
@@ -84,15 +100,23 @@ def digest(value):
 
 def canonical_signals(signals):
     """Copy exact trusted adapter signals, independent of delivery ordering."""
-    if signals is None or isinstance(signals, (str, bytes)):
+    if signals is None or isinstance(signals, (str, bytes, MappingABC)):
         raise Denied('trusted signal sequence required')
     try:
-        values = tuple(signals)
+        iterator = iter(signals)
     except TypeError as err:
         raise Denied('trusted signal sequence required') from err
-    if any(not isinstance(value, str) or not value for value in values):
-        raise Denied('invalid trusted signal')
-    return tuple(sorted(set(values)))
+    unique = set()
+    for index, value in enumerate(islice(iterator, MAX_SIGNAL_ITEMS + 1)):
+        if index >= MAX_SIGNAL_ITEMS:
+            raise Denied('trusted signal input exceeds scan limit')
+        if (type(value) is not str or not 1 <= len(value) <= 128
+            or any(char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
+            raise Denied('invalid trusted signal')
+        unique.add(value)
+        if len(unique) > MAX_SIGNALS:
+            raise Denied('too many distinct trusted signals')
+    return tuple(sorted(unique))
 
 
 def intake_evidence(envelope, signals, payload_sha256=None):
@@ -132,12 +156,35 @@ class Mapping:
 
 class Resolver:
     def __init__(self, mappings):
-        self.mappings = tuple(mappings)
+        self.mappings = mappings
+
+    @property
+    def mappings(self):
+        return self._mappings
+
+    @mappings.setter
+    def mappings(self, mappings):
+        snapshot = tuple(mappings)
+        index = {}
+        for mapping in snapshot:
+            index.setdefault((mapping.firm_id, mapping.clio_id), []).append(mapping)
+        self._mappings = snapshot
+        self._index = {key: tuple(group) for key, group in index.items()}
+
+    def matches(self, firm_id, signals):
+        if not isinstance(firm_id, UUID):
+            raise Denied('firm UUID required')
+        return tuple(
+            mapping
+            for signal in canonical_signals(signals)
+            for mapping in self._index.get((firm_id, signal), ())
+        )
 
     def resolve(self, firm_id, signals):
         signals = canonical_signals(signals)
-        groups = [tuple(m for m in self.mappings if m.firm_id == firm_id and m.clio_id == s)
-                  for s in signals]
+        if not isinstance(firm_id, UUID):
+            raise Denied('firm UUID required')
+        groups = [self._index.get((firm_id, signal), ()) for signal in signals]
         matches = {m.matter_id for group in groups for m in group}
         if not matches:
             return None, 'UNMAPPED_MATTER_SIGNAL'
@@ -201,16 +248,33 @@ TERMINAL = {State.QUARANTINED,State.FAILED,State.REJECTED,State.CANCELLED,
             State.COMPLETED,State.NEEDS_RECONCILIATION}
 
 
+def validate_transition(expected, target, actor):
+    """Accept enum members or exact enum-value strings before hashing input."""
+    normalized = []
+    for value, enum_type in ((expected, State), (target, State), (actor, Actor)):
+        if isinstance(value, enum_type):
+            normalized.append(value)
+        elif type(value) is str:
+            try:
+                normalized.append(enum_type(value))
+            except ValueError as err:
+                raise Denied('invalid transition state or actor') from err
+        else:
+            raise Denied('invalid transition state or actor')
+    return tuple(normalized)
+
+
 def check_edge(expected, target, actor, matter_id, reason, *, mock=False):
-    if not actor or not isinstance(actor, str):
-        raise Denied('actor required')
+    expected, target, actor = validate_transition(expected, target, actor)
+    if type(mock) is not bool:
+        raise Denied('invalid mock flag')
     edge = (expected, target)
     if edge not in EDGES:
         raise Denied('undefined transition')
     if (target in RESERVED and not mock) or EDGES[edge] != actor:
         raise Denied('transition not authorized in PR1')
     if target == State.QUARANTINED:
-        if matter_id is not None or reason not in QUARANTINE_REASONS:
+        if matter_id is not None or type(reason) is not str or reason not in QUARANTINE_REASONS:
             raise Denied('invalid quarantine')
     elif target in ({State.VALIDATED,State.RUNNING,State.REVIEW_REQUIRED,State.REJECTED,State.FAILED,State.CANCELLED} | RESERVED) and matter_id is None:
         raise Denied('verified scope required')
@@ -301,6 +365,8 @@ class Run:
     _resolved_matter_id: UUID | None = field(default=None, repr=False)
     _executor: object = field(default=None, repr=False, compare=False)
     _leased_effect_digest: str | None = field(default=None, repr=False)
+    replay_conflict_count: int = 0
+    replay_conflict_digests: tuple[str, ...] = ()
 
     @property
     def independently_checked(self) -> bool:
@@ -381,10 +447,7 @@ class Run:
             if exp_matter is None or not matched_ids:
                 raise Denied('verified matter mapping required')
             for clio_id in matched_ids:
-                matches = [
-                    m for m in intake.resolver.mappings
-                    if (m.firm_id, m.clio_id) == (self.firm_id, clio_id)
-                ]
+                matches = intake.resolver.matches(self.firm_id, (clio_id,))
                 if (
                     len(matches) != 1
                     or matches[0].matter_id != exp_matter
@@ -500,6 +563,9 @@ class Run:
         safety_quarantine=False, leased_digest=None,
         _intake_token=None, _executor=None, _executor_token=None,
     ):
+        expected, target, actor = validate_transition(expected, target, actor)
+        if type(mock) is not bool or type(safety_quarantine) is not bool:
+            raise Denied('invalid transition flag')
         if self.status != expected:
             raise Denied('stale status')
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
@@ -511,12 +577,11 @@ class Run:
             and (expected, target, actor) != (State.RECEIVED, State.VALIDATED, Actor.RESOLVER)
         ):
             raise Denied('scope change denied')
-        if target == State.REVIEW_REQUIRED and independently_checked is not True:
-            raise Denied('independent review required')
-        if independently_checked is not False and (
-            independently_checked is not True
-            or (expected, target, actor)
-            != (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW)
+        review_edge = (
+            expected, target, actor
+        ) == (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW)
+        if (expected == State.RECEIVED or target == State.QUARANTINED) and (
+            independently_checked is not False
         ):
             raise Denied('independent review binding denied')
         if resolution_evidence is not None and (
@@ -584,6 +649,10 @@ class Run:
             )
 
         self._require_eligibility(now)
+        if review_edge and independently_checked is not True:
+            raise Denied('independent review required')
+        if not review_edge and independently_checked is not False:
+            raise Denied('independent review binding denied')
         self.matter_id = matter
         self.status = target
         if target == State.REVIEW_REQUIRED:
@@ -601,6 +670,7 @@ class Intake:
     def __init__(self, resolver):
         self.resolver = resolver
         self.runs = {}
+        self._event_runs = {}
         self.outbox = []
         self.steps = []
         self.agent_calls = []
@@ -608,8 +678,10 @@ class Intake:
         self._conflicted_runs: set[UUID] = set()
 
     def _owned(self, run):
-        if (run._intake is not self
-            or not any(existing is run for existing in self.runs.values())
+        if (not isinstance(run, Run)
+            or not isinstance(run.run_id, UUID)
+            or run._intake is not self
+            or self.runs.get(run.run_id) is not run
             or not isinstance(run.intake_evidence, MappingProxyType)
             or run.intake_evidence.get('firm_id') != str(run.firm_id)
             or run.intake_evidence.get('run_id') != str(run.run_id)):
@@ -624,8 +696,7 @@ class Intake:
         matter, reason = self.resolver.resolve(run.firm_id, signals)
         target = State.VALIDATED if matter else State.QUARANTINED
         matched = tuple(sorted(
-            (m for m in self.resolver.mappings
-             if m.firm_id == run.firm_id and m.clio_id in signals),
+            self.resolver.matches(run.firm_id, signals),
             key=lambda m: (m.clio_id, str(m.matter_id), m.mapping_version),
         ))
         snapshot = MappingProxyType({
@@ -657,14 +728,24 @@ class Intake:
     def ingest_event(self, envelope, signals, *, payload_sha256=None):
         evidence = intake_evidence(envelope, signals, payload_sha256)
         key = (envelope.source, envelope.dedup_key)
-        if key in self.runs:
-            run = self.runs[key]
+        if key in self._event_runs:
+            run = self.runs[self._event_runs[key]]
+            self._owned(run)
             if evidence['evidence_sha256'] != run.intake_evidence['evidence_sha256']:
-                self._conflicted_runs.add(run.run_id)
-                try:
-                    self._quarantine(run, envelope.received_at, 'CONFLICTING_REPLAY_SIGNALS')
-                finally:
-                    self._conflicted_runs.discard(run.run_id)
+                run.replay_conflict_count += 1
+                conflict_digest = evidence['evidence_sha256']
+                if (conflict_digest not in run.replay_conflict_digests
+                    and len(run.replay_conflict_digests) < MAX_REPLAY_CONFLICT_DIGESTS):
+                    run.replay_conflict_digests += (conflict_digest,)
+                    self._conflicted_runs.add(run.run_id)
+                    try:
+                        self._quarantine(run, envelope.received_at, 'CONFLICTING_REPLAY_SIGNALS')
+                    finally:
+                        self._conflicted_runs.discard(run.run_id)
+            elif run.status == State.RECEIVED:
+                self.resolve_run(run, now=envelope.received_at)
+            elif run.status not in TERMINAL:
+                self.revalidate_run(run, envelope.received_at)
             return run, False
         run = Run(envelope.firm_id, _intake=self)
         run._intake_evidence = MappingProxyType({
@@ -672,7 +753,8 @@ class Intake:
             'run_id': str(run.run_id), 'firm_id': str(run.firm_id),
         })
         run.audit.append(Audit(State.RECEIVED, Actor.INGRESS, 'ACCEPTED', envelope.received_at))
-        self.runs[key] = run
+        self.runs[run.run_id] = run
+        self._event_runs[key] = run.run_id
         self.outbox.append((run.run_id, 'RESOLUTION_PENDING'))
         return run, True
 
@@ -700,7 +782,7 @@ class Intake:
 
     def accept(self, envelope, signals, *, payload_sha256=None):
         run, created = self.ingest_event(envelope, signals, payload_sha256=payload_sha256)
-        if created:
+        if run.status == State.RECEIVED:
             self.resolve_run(run, now=envelope.received_at)
         return run, created
 

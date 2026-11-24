@@ -780,3 +780,248 @@ def test_direct_run_move_edges_enforce_resolution_quarantine_and_executor_bindin
                 NOW, 'BYPASS', mock=True, leased_digest=p.action_digest,
             )
     assert not exe.effects and tuple(run.audit) == approved_audit
+
+
+def test_intake_ownership_uses_run_id_index_without_scanning_other_runs():
+    class NoScanDict(dict):
+        def values(self):
+            raise AssertionError('ownership must not scan runs')
+
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    assert intake.runs[run.run_id] is run
+    intake.runs = NoScanDict(intake.runs)
+    intake.start(run, NOW)
+    assert run.status == State.RUNNING
+
+
+def test_resolver_index_preserves_duplicate_mapping_denials_and_rebuilds_on_assignment():
+    first = Mapping(FIRM, MATTER, 'clio-001')
+    indexed = Resolver([first, first, Mapping(OTHER, OTHER, 'clio-001')])
+    assert indexed.resolve(FIRM, ['clio-001']) == (None, 'CONFLICTING_MATTER_SIGNALS')
+    indexed.mappings = [first, Mapping(FIRM, MATTER, 'clio-alias')]
+    assert indexed.resolve(FIRM, ['clio-001', 'clio-alias']) == (MATTER, 'MATTER_VERIFIED')
+
+    class NoScanTuple(tuple):
+        def __iter__(self):
+            raise AssertionError('resolution must use the mapping index')
+
+    indexed._mappings = NoScanTuple(indexed.mappings)
+    intake = Intake(indexed)
+    run, _ = intake.accept(event(), ['clio-001'])
+    intake.start(run, NOW)
+    assert run.status == State.RUNNING
+
+
+def test_conflict_audit_and_digest_storage_are_bounded_while_counting_every_delivery():
+    from services.correspondence.core import MAX_REPLAY_CONFLICT_DIGESTS
+
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    before = len(run.audit)
+    for _ in range(100):
+        intake.ingest_event(event(), ['clio-002'])
+    assert run.replay_conflict_count == 100
+    assert len(run.replay_conflict_digests) == 1
+    assert len(run.audit) == before + 1
+
+    for value in range(100):
+        intake.ingest_event(event(), ['clio-001'], payload_sha256=f'{value:064x}')
+    assert run.replay_conflict_count == 200
+    assert len(run.replay_conflict_digests) == MAX_REPLAY_CONFLICT_DIGESTS
+    assert len(run.audit) == before + MAX_REPLAY_CONFLICT_DIGESTS
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert len(intake.runs) == len(intake.outbox) == 1 and not intake.agent_calls
+
+
+@pytest.mark.parametrize('replay_method', ['ingest_event', 'accept'])
+def test_identical_received_replay_retries_resolution_after_transient_failure(replay_method):
+    class TransientResolver(Resolver):
+        fail = True
+
+        def resolve(self, firm_id, signals):
+            if self.fail:
+                self.fail = False
+                raise Denied('synthetic transient resolver failure')
+            return super().resolve(firm_id, signals)
+
+    intake = Intake(TransientResolver(resolver().mappings))
+    with pytest.raises(Denied):
+        intake.accept(event(), ['clio-001'])
+    run = next(iter(intake.runs.values()))
+    assert run.status == State.RECEIVED and len(run.audit) == 1
+    same, created = getattr(intake, replay_method)(event(), ['clio-001'])
+    assert same is run and not created and run.status == State.VALIDATED
+    assert len(intake.runs) == len(intake.outbox) == 1 and len(run.audit) == 2
+
+
+def test_revalidation_cannot_substitute_another_clio_alias_for_the_original_signals():
+    intake = Intake(Resolver([
+        Mapping(FIRM, MATTER, 'clio-original'), Mapping(FIRM, MATTER, 'clio-alias'),
+    ]))
+    run, _ = intake.accept(event(), ['clio-original'])
+    original = run.resolution_evidence
+    intake.resolver.mappings = [Mapping(FIRM, MATTER, 'clio-alias')]
+    with pytest.raises(Denied):
+        intake.start(run, NOW)
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.resolution_evidence is original
+    assert original['extracted_signals'] == ('clio-original',)
+    assert not intake.agent_calls
+
+
+@pytest.mark.parametrize('mapping_change', ['revoked', 'remapped'])
+def test_identical_active_replay_revalidates_original_mapping_before_return(mapping_change):
+    from dataclasses import replace
+
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    intake.start(run, NOW)
+    original = run.resolution_evidence
+    original_intake = run.intake_evidence
+    intake.resolver.mappings = tuple(
+        replace(mapping, **(
+            {'eligibility': 'RESTRICTED'} if mapping_change == 'revoked'
+            else {'matter_id': OTHER}
+        )) if mapping.clio_id == 'clio-001' else mapping
+        for mapping in intake.resolver.mappings
+    )
+    same, created = intake.ingest_event(event(), ['clio-001'])
+    assert same is run and not created
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.audit[-1].reason == 'MATTER_INELIGIBLE'
+    assert run.resolution_evidence is original and run.intake_evidence is original_intake
+    assert run.resolved_matter_id == MATTER
+    assert len(intake.runs) == len(intake.outbox) == len(intake.agent_calls) == 1
+
+
+@pytest.mark.parametrize('value', [True, False, 1.0, '1', 2])
+def test_schema_version_requires_exact_integer_one(value):
+    with pytest.raises(ValidationError):
+        event(schema_version=value)
+
+
+@pytest.mark.parametrize('value', [
+    '1700000000', '1700000000.0', '2026-11-23', '2026-11-23T14:00:00',
+    '0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59-01:00',
+])
+def test_timestamp_text_requires_timezone_iso_syntax_and_representable_utc(value):
+    with pytest.raises(ValidationError):
+        event(occurred_at=value)
+
+
+def test_timestamp_datetime_overflow_is_a_validation_error():
+    from datetime import timezone
+
+    value = datetime.min.replace(tzinfo=timezone(timedelta(hours=1)))
+    with pytest.raises(ValidationError):
+        event(occurred_at=value)
+
+
+@pytest.mark.parametrize('signals', [
+    {'clio-001': 'ignored'}, 'clio-001', None, 3, [''], ['x' * 129],
+    ['clio 001'], ['clio\t001'], ['clio\x00001'], ['clio\x7f001'], ['clio\x85001'],
+    ['clio\u2003001'], ['clio\u00a0001'], [None], [1],
+])
+def test_signal_contract_rejects_ambiguous_or_invalid_identifiers(signals):
+    from services.correspondence.core import canonical_signals
+
+    with pytest.raises(Denied):
+        canonical_signals(signals)
+
+
+def test_signal_iterator_scan_and_unique_count_are_bounded_without_normalizing_identity():
+    from itertools import repeat
+
+    from services.correspondence.core import MAX_SIGNAL_ITEMS, canonical_signals
+
+    assert canonical_signals(['clio-001'] * 33) == ('clio-001',)
+    assert canonical_signals(['Clio-001', 'clio-001']) == ('Clio-001', 'clio-001')
+    with pytest.raises(Denied):
+        canonical_signals(f'clio-{value}' for value in range(33))
+    consumed = 0
+
+    def infinite_duplicates():
+        nonlocal consumed
+        for item in repeat('clio-001'):
+            consumed += 1
+            yield item
+
+    with pytest.raises(Denied):
+        canonical_signals(infinite_duplicates())
+    assert consumed == MAX_SIGNAL_ITEMS + 1
+
+
+def test_state_and_actor_validation_rejects_unhashable_and_unknown_values_cleanly():
+    from services.correspondence.core import check_edge
+
+    class UnhashableText(str):
+        __hash__ = None
+
+    class HashTrap:
+        def __hash__(self):
+            raise AssertionError('invalid inputs must not be hashed')
+
+    for value in ([], {}, set(), None, False, 0, object(), UnhashableText('RUNNING'), HashTrap()):
+        for args in (
+            (value, State.RUNNING, Actor.COORDINATOR),
+            (State.VALIDATED, value, Actor.COORDINATOR),
+            (State.VALIDATED, State.RUNNING, value),
+        ):
+            with pytest.raises(Denied):
+                check_edge(*args, MATTER, 'INVALID')
+    check_edge('VALIDATED', 'RUNNING', 'COORDINATOR', MATTER, 'VALID')
+
+
+@pytest.mark.parametrize('phase,flag', [('start', True), ('review', False), ('review', None)])
+def test_revocation_quarantines_before_independent_review_flag_denial(phase, flag):
+    from dataclasses import replace
+
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    if phase == 'review':
+        intake.start(run, NOW)
+    intake.resolver.mappings = tuple(
+        replace(mapping, eligibility='RESTRICTED') if mapping.matter_id == MATTER else mapping
+        for mapping in intake.resolver.mappings
+    )
+    target, actor = (
+        (State.RUNNING, Actor.COORDINATOR) if phase == 'start'
+        else (State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW)
+    )
+    with pytest.raises(Denied):
+        run.move(run.status, target, actor, NOW, 'CHECK', independently_checked=flag)
+    assert run.status == State.QUARANTINED and run.matter_id is None
+    assert run.audit[-1].reason == 'MATTER_INELIGIBLE'
+    assert run.independently_checked is False
+
+
+def test_seeded_malformed_input_fuzz_has_no_uncontrolled_exceptions():
+    import random
+
+    from services.correspondence.core import canonical_signals, check_edge
+
+    randomizer = random.Random(721)
+    values = [
+        None, True, False, 0, 1, 1.0, -1, [], {}, set(), ['clio-001'],
+        {'clio-001': 1}, '', ' ', 'RUNNING', 'VALIDATED', 'COORDINATOR',
+        '2026-11-23T14:00:00Z', '1700000000', 'clio-001', object(),
+    ]
+    uncontrolled = []
+    for _ in range(10_000):
+        operation = randomizer.randrange(3)
+        value = randomizer.choice(values)
+        try:
+            if operation == 0:
+                event(**{randomizer.choice(('schema_version', 'occurred_at', 'received_at')): value})
+            elif operation == 1:
+                canonical_signals(value)
+            else:
+                args = [State.VALIDATED, State.RUNNING, Actor.COORDINATOR]
+                args[randomizer.randrange(3)] = value
+                check_edge(*args, MATTER, 'FUZZ')
+        except (Denied, ValidationError):
+            pass
+        except Exception as err:  # noqa: BLE001 - fuzz counts every uncontrolled failure.
+            uncontrolled.append(type(err).__name__)
+    assert uncontrolled == []

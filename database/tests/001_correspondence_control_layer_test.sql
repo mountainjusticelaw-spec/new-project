@@ -9,6 +9,22 @@ DO $$ BEGIN
   RAISE EXCEPTION 'all twelve tables must force RLS';
  END IF;
 END $$;
+-- Bound adapter signal validation is identical to the Python contract.
+DO $$ BEGIN
+ IF weaverlaw.canonical_signals('["clio-001","clio-001"]'::jsonb)<>'["clio-001"]'::jsonb THEN
+  RAISE EXCEPTION 'signal canonicalization changed identity';
+ END IF;
+ BEGIN
+  PERFORM weaverlaw.canonical_signals('["clio bad"]'::jsonb);
+  RAISE EXCEPTION 'signal whitespace accepted';
+ EXCEPTION WHEN check_violation THEN NULL;
+ END;
+ BEGIN
+  PERFORM weaverlaw.canonical_signals('{}'::jsonb);
+  RAISE EXCEPTION 'non-array signals accepted';
+ EXCEPTION WHEN check_violation THEN NULL;
+ END;
+END $$;
 -- Local superuser seeds only synthetic rows. Production mapping writes not in scope.
 INSERT INTO weaverlaw.matter_mapping VALUES
  ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002','clio-001','OPEN','v1'),
@@ -78,4 +94,27 @@ DO $$ BEGIN
  IF (SELECT status FROM weaverlaw.workflow_run) <> 'VALIDATED' THEN RAISE EXCEPTION 'audit failure failed to roll back state'; END IF;
 END $$;
 RESET ROLE;
+-- Provider reassignment must revoke access even while the original internal matter stays OPEN.
+GRANT INSERT ON weaverlaw.audit_event TO wl_audit_writer;
+UPDATE weaverlaw.matter_mapping SET clio_matter_id='clio-001-retired' WHERE verified_matter_id='00000000-0000-0000-0000-000000000002';
+UPDATE weaverlaw.matter_mapping SET clio_matter_id='clio-001' WHERE verified_matter_id='00000000-0000-0000-0000-000000000003';
+SET LOCAL ROLE wl_worker;
+SELECT set_config('app.verified_matter_id','00000000-0000-0000-0000-000000000002',true);
+DO $$ BEGIN
+ IF EXISTS(SELECT 1 FROM weaverlaw.workflow_run) OR EXISTS(SELECT 1 FROM weaverlaw.workflow_step) THEN
+  RAISE EXCEPTION 'provider reassignment retained prior matter visibility';
+ END IF;
+ IF weaverlaw.revalidate_run('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000031','00000000-0000-0000-0000-000000000002') THEN
+  RAISE EXCEPTION 'provider reassignment passed revalidation';
+ END IF;
+END $$;
+RESET ROLE;
+DO $$ BEGIN
+ IF NOT EXISTS(SELECT 1 FROM weaverlaw.workflow_run WHERE run_id='00000000-0000-0000-0000-000000000031'
+  AND status='QUARANTINED' AND reason_code='MATTER_INELIGIBLE' AND verified_matter_id IS NULL
+  AND resolved_matter_id='00000000-0000-0000-0000-000000000002'
+  AND resolution_evidence->>'decision'='VALIDATED') THEN
+  RAISE EXCEPTION 'reassignment quarantine lost original evidence';
+ END IF;
+END $$;
 ROLLBACK;

@@ -76,7 +76,7 @@ def test_conditional_update_uses_status_and_scope():
     conn = FakeConnection([(True,), (UUID(int=3),)])
     move(conn)
     assert conn.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
-    assert 'pg_catalog.set_config' in conn.commands[1][0]
+    assert 'pg_catalog.set_config' in conn.commands[3][0]
     sql, args = conn.commands[-1]
     assert 'WHERE run_id=%s AND firm_id=%s AND status=%s' in sql
     assert 'verified_matter_id IS NOT DISTINCT FROM %s' in sql
@@ -115,12 +115,12 @@ def test_receive_new_replay_and_firm_mismatch():
     run_id, created = receive(conn_new, env, trusted_firm_id=UUID(int=1))
     assert created is True and run_id is not None and conn_new.commits == 1
     assert conn_new.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
-    assert len(conn_new.commands) == 5  # search_path + scope + inbox + run + outbox
+    assert len(conn_new.commands) == 7  # path + two timeouts + scope + inbox/run/outbox
 
     conn_dup = FakeConnection(returned=[None, (UUID(int=11),), (run_id,)])
     dup_run_id, dup_created = receive(conn_dup, env, trusted_firm_id=UUID(int=1))
     assert dup_run_id == run_id and dup_created is False and conn_dup.commits == 1
-    assert len(conn_dup.commands) == 5  # scope + conflict + bound inbox + replay verification
+    assert len(conn_dup.commands) == 7  # bounded scope + conflict + bound inbox/replay
 
 
 def test_resolve_run_promotes_or_quarantines():
@@ -134,32 +134,35 @@ def test_resolve_run_promotes_or_quarantines():
     )
     assert (target, resolved_matter, reason) == (State.VALIDATED, matter, 'MATTER_VERIFIED')
     assert conn_ok.commands[0] == ('SET LOCAL search_path = pg_catalog', None)
-    assert 'clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])' in conn_ok.commands[3][0]
-    assert 'FOR SHARE' in conn_ok.commands[3][0]
+    assert 'clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])' in conn_ok.commands[5][0]
+    assert 'FOR SHARE' in conn_ok.commands[5][0]
     assert conn_ok.commits == 1
 
-    conn_quarantine = FakeConnection(returned=[(bound_envelope(['bad signal!']),), (run_id,)], rows=[])
+    conn_quarantine = FakeConnection(returned=[(bound_envelope(['unmapped-signal!']),), (run_id,)], rows=[])
     q_target, q_matter, q_reason = resolve_run(
-        conn_quarantine, firm_id=firm, run_id=run_id, trusted_signals=['bad signal!'],
+        conn_quarantine, firm_id=firm, run_id=run_id, trusted_signals=['unmapped-signal!'],
     )
     assert (q_target, q_matter, q_reason) == (State.QUARANTINED, None, 'UNMAPPED_MATTER_SIGNAL')
     assert conn_quarantine.commits == 1
 
 
 def test_transition_guards_independent_review_and_resolution_path():
-    conn = FakeConnection((UUID(int=3),))
-    with pytest.raises(Denied):
-        transition(
-            conn, firm_id=UUID(int=1), matter_id=UUID(int=2), run_id=UUID(int=3),
-            expected=State.RUNNING, target=State.REVIEW_REQUIRED,
-            actor=Actor.INDEPENDENT_REVIEW, reason='REVIEW', independently_checked=False,
-        )
-    with pytest.raises(Denied):
-        transition(
-            conn, firm_id=UUID(int=1), matter_id=UUID(int=2), run_id=UUID(int=3),
-            expected=State.VALIDATED, target=State.RUNNING,
-            actor=Actor.COORDINATOR, reason='START', independently_checked=True,
-        )
+    for expected, target, actor, checked in (
+        (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW, False),
+        (State.VALIDATED, State.RUNNING, Actor.COORDINATOR, True),
+    ):
+        conn = FakeConnection([(True,)])
+        with pytest.raises(Denied, match='independent review'):
+            transition(
+                conn, firm_id=UUID(int=1), matter_id=UUID(int=2), run_id=UUID(int=3),
+                expected=expected, target=target, actor=actor,
+                reason='REVIEW', independently_checked=checked,
+            )
+        assert 'revalidate_run' in conn.commands[-1][0]
+        assert conn.rollbacks == 1 and not conn.commits
+        assert not any(sql.startswith('UPDATE') for sql, _ in conn.commands)
+
+    conn = FakeConnection()
     with pytest.raises(Denied):
         transition(
             conn, firm_id=UUID(int=1), matter_id=None, run_id=UUID(int=3),
@@ -187,3 +190,26 @@ def test_resolve_rejects_mismatched_or_tampered_bound_evidence():
             resolve_run(conn, firm_id=UUID(int=1), run_id=UUID(int=3), trusted_signals=['clio-other'])
         assert conn.rollbacks == 1 and not conn.commits
         assert not any(sql.startswith('UPDATE') for sql, _ in conn.commands)
+
+
+def test_scope_sets_transaction_local_timeout_bounds():
+    conn = FakeConnection([(True,), (UUID(int=3),)])
+    move(conn)
+    assert ("SET LOCAL lock_timeout = '5s'", None) in conn.commands
+    assert ("SET LOCAL statement_timeout = '15s'", None) in conn.commands
+
+
+@pytest.mark.parametrize('expected,target,actor,checked', [
+    (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW, False),
+    (State.VALIDATED, State.RUNNING, Actor.COORDINATOR, True),
+])
+def test_review_flag_cannot_preempt_revoked_binding_quarantine(expected, target, actor, checked):
+    conn = FakeConnection([(False,)])
+    with pytest.raises(Denied, match='quarantined'):
+        transition(
+            conn, firm_id=UUID(int=1), matter_id=UUID(int=2), run_id=UUID(int=3),
+            expected=expected, target=target, actor=actor,
+            reason='ATTEMPT', independently_checked=checked,
+        )
+    assert conn.commits == 1 and not conn.rollbacks
+    assert 'revalidate_run' in conn.commands[-1][0]

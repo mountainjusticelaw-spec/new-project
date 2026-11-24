@@ -17,6 +17,7 @@ from .core import (
     canonical_signals,
     check_edge,
     intake_evidence,
+    validate_transition,
 )
 
 
@@ -28,6 +29,8 @@ def _idle(conn):
 
 def _scope(cur, firm_id, matter_id=None):
     cur.execute("SET LOCAL search_path = pg_catalog")
+    cur.execute("SET LOCAL lock_timeout = '5s'")
+    cur.execute("SET LOCAL statement_timeout = '15s'")
     cur.execute(
         "SELECT pg_catalog.set_config('app.verified_firm_id', %s, true), "
         "pg_catalog.set_config('app.verified_matter_id', %s, true)",
@@ -36,6 +39,7 @@ def _scope(cur, firm_id, matter_id=None):
 
 
 def _cas(cur, firm_id, run_id, expected, target, actor, matter_id, reason):
+    expected, target, actor = validate_transition(expected, target, actor)
     check_edge(expected, target, actor, matter_id, reason)
     # A database AFTER trigger appends audit_event in this same transaction.
     cur.execute("""UPDATE weaverlaw.workflow_run
@@ -134,7 +138,7 @@ def resolve_run(conn, *, firm_id, run_id, trusted_signals=None):
         cur.execute("""SELECT firm_id,verified_matter_id,clio_matter_id,eligibility,mapping_version
             FROM weaverlaw.matter_mapping
             WHERE firm_id=%s AND clio_matter_id::pg_catalog.text=ANY(%s::pg_catalog.text[])
-            FOR SHARE""", (firm_id,list(signals)))
+            ORDER BY verified_matter_id FOR SHARE""", (firm_id,list(signals)))
         matter, reason = Resolver(Mapping(*mapping) for mapping in cur.fetchall()).resolve(firm_id,signals)
         target = State.VALIDATED if matter else State.QUARANTINED
         _scope(cur,firm_id,matter)
@@ -166,14 +170,7 @@ def transition(
     independently_checked=False,
 ):
     """Trusted role dispatch with continuous eligibility and atomic CAS/audit."""
-    if target == State.REVIEW_REQUIRED and independently_checked is not True:
-        raise Denied('independent review required')
-    if independently_checked is not False and (
-        independently_checked is not True
-        or (expected, target, actor)
-        != (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW)
-    ):
-        raise Denied('independent review binding denied')
+    expected, target, actor = validate_transition(expected, target, actor)
     if expected == State.RECEIVED or actor == Actor.RESOLVER or matter_id is None:
         raise Denied('use dedicated resolution path')
     check_edge(expected, target, actor, matter_id, reason)
@@ -182,6 +179,16 @@ def transition(
         _scope(cur,firm_id,matter_id)
         eligible = _revalidate(cur,firm_id,run_id,matter_id)
         if eligible:
+            # Revoked bindings must be quarantined even when review evidence is
+            # absent or a caller supplied the review flag on the wrong edge.
+            if target == State.REVIEW_REQUIRED and independently_checked is not True:
+                raise Denied('independent review required')
+            if independently_checked is not False and (
+                independently_checked is not True
+                or (expected, target, actor)
+                != (State.RUNNING, State.REVIEW_REQUIRED, Actor.INDEPENDENT_REVIEW)
+            ):
+                raise Denied('independent review binding denied')
             _cas(cur,firm_id,run_id,expected,target,actor,matter_id,reason)
     # Denial must not roll back the durable quarantine recorded above.
     if not eligible:
