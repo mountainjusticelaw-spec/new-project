@@ -229,3 +229,38 @@ def test_cancelled_requires_verified_matter_scope():
     from services.correspondence.core import check_edge
     with pytest.raises(Denied):
         check_edge(State.VALIDATED, State.CANCELLED, Actor.COORDINATOR, None, 'CANCEL')
+
+
+def test_execute_accepts_single_use_source_versions_iterator():
+    from services.correspondence.core import Approval, MockPolicyExecutor, Proposal
+
+    intake = Intake(resolver())
+    run, _ = intake.accept(event(), ['clio-001'])
+    intake.start(run, NOW)
+    intake.review(run, NOW, independently_checked=True)
+    p = Proposal(
+        run.run_id, MATTER, FIRM, 'mock.review', 'synthetic-sink',
+        'draft-only', (('synthetic-message-001', 'v1'),), 'p1',
+    )
+    a = Approval(
+        run.run_id, FIRM, MATTER, UUID(int=10), p.action_digest,
+        p.destination, p.policy_version, NOW + timedelta(minutes=5),
+    )
+    exe = MockPolicyExecutor()
+    exe.approve(run, p, a, (pair for pair in p.source_versions), NOW, permitted=True)
+
+    # Single-use generator with stale version still fails cleanly without mutating state.
+    before = tuple(run.audit)
+    with pytest.raises(Denied):
+        exe.execute(
+            run, p, a, (('synthetic-message-001', 'v2') for _ in (1,)),
+            NOW, permitted=True, enabled=True,
+        )
+    assert run.status == State.APPROVED and not exe.effects and tuple(run.audit) == before
+
+    # Single-use generator with matching pinned version succeeds across dual validation checks.
+    exe.execute(
+        run, p, a, (pair for pair in p.source_versions),
+        NOW, permitted=True, enabled=True,
+    )
+    assert run.status == State.COMPLETED and len(exe.effects) == 1

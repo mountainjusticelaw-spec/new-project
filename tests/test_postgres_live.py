@@ -1,7 +1,8 @@
 """Live disposable PostgreSQL 16+ security, RLS, audit, concurrency, and pool tests.
 
-Spins up an isolated disposable cluster via `initdb` + `pg_ctl` (or connects to an
-explicit disposable `WEAVERLAW_TEST_PG_DSN` targeting `weaverlaw_pr1_test`), applies
+Always spins up a fresh, isolated disposable cluster via `initdb` + `pg_ctl` bound
+strictly to `127.0.0.1` and a temporary Unix socket directory, creates disposable
+database `weaverlaw_pr1_test`, applies
 `database/migrations/001_correspondence_control_layer.sql`, runs the SQL integration
 assertions in `database/tests/001_correspondence_control_layer_test.sql`, and verifies
 all PR #1A merge blockers with real `psycopg` connections.
@@ -76,11 +77,6 @@ def pg_dsn(tmp_path_factory):
         import psycopg  # noqa: F401
     except ImportError:
         _skip_or_fail('psycopg is not installed; live PostgreSQL suite requires psycopg>=3.2')
-
-    explicit_dsn = os.environ.get('WEAVERLAW_TEST_PG_DSN')
-    if explicit_dsn:
-        yield explicit_dsn
-        return
 
     initdb = _find_pg_tool('initdb')
     pg_ctl = _find_pg_tool('pg_ctl')
@@ -502,6 +498,20 @@ def test_concurrency_dedup_cas_and_mapping_revocation_races(seeded_cluster):
 
 
 def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
+    with (
+        _connect(seeded_cluster, 'wl_intake') as intake_conn,
+        _connect(seeded_cluster, 'wl_resolver') as resolver_conn,
+        _connect(seeded_cluster) as admin,
+    ):
+        pool_run_id, created = receive(
+            intake_conn, _make_envelope(source_ref='synthetic-pool-isolation-001'), trusted_firm_id=FIRM_A,
+        )
+        assert created is True and pool_run_id is not None
+        assert resolve_run(
+            resolver_conn, firm_id=FIRM_A, run_id=pool_run_id, trusted_signals=['clio-live-a'],
+        ) == (State.VALIDATED, MATTER_A, 'MATTER_VERIFIED')
+        _seed_tier_b_bundle(admin, firm_id=FIRM_A, run_id=pool_run_id, matter_id=MATTER_A, tag='pool')
+
     with _connect(seeded_cluster) as pooled_conn:
         base_user = pooled_conn.execute('SELECT current_user').fetchone()[0]
 
@@ -519,7 +529,13 @@ def test_connection_pool_set_local_and_role_never_leak(seeded_cluster):
             assert in_tx_user == 'wl_worker'
             assert in_tx_firm == str(FIRM_A)
             assert in_tx_matter == str(MATTER_A)
-            assert pooled_conn.execute('SELECT count(*) FROM weaverlaw.workflow_run').fetchone()[0] >= 1
+            assert pooled_conn.execute(
+                'SELECT count(*) FROM weaverlaw.workflow_run WHERE run_id = %s', (pool_run_id,),
+            ).fetchone()[0] == 1
+            for table in TIER_B_TABLES:
+                assert pooled_conn.execute(
+                    f'SELECT count(*) FROM weaverlaw.{table} WHERE run_id = %s', (pool_run_id,),
+                ).fetchone()[0] == 1
 
         # Next transaction on the EXACT SAME physical connection must have clean role & empty GUCs
         with pooled_conn.transaction():

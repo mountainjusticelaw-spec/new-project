@@ -316,7 +316,17 @@ class MockPolicyExecutor:
             or (p.action_digest,p.destination,p.policy_version) != (a.action_digest,a.destination,a.policy_version)):
             raise Denied('invalid synthetic approval')
 
+    @staticmethod
+    def _materialize_versions(versions):
+        if versions is None:
+            raise Denied('invalid synthetic approval')
+        try:
+            return tuple(versions)
+        except TypeError as err:
+            raise Denied('invalid synthetic approval') from err
+
     def approve(self, run, p, a, versions, now, *, permitted=False):
+        versions = self._materialize_versions(versions)
         self._check(run,p,a,versions,now,permitted,True)
         canonical_sources = tuple(sorted((ref, ver) for ref, ver in p.source_versions))
         bound_proposal = Proposal(
@@ -349,6 +359,7 @@ class MockPolicyExecutor:
         self.revoked_approvals.add((run_id, approval_id))
 
     def execute(self, run, p=None, a=None, versions=(), now=None, *, approval_id=None, permitted=False, enabled=False, timeout=False):
+        versions = self._materialize_versions(versions)
         bound = run.accepted_approval
         if bound is None or self.accepted_approvals.get(run.run_id) != bound:
             raise Denied('missing or unregistered run approval')
