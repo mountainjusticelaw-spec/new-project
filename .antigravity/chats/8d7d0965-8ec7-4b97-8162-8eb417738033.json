@@ -124,6 +124,18 @@
       "created_at": "2026-11-24T10:24:41.884Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "4ed55048-c846-4445-84e5-b3c634249633",
+      "role": "agent",
+      "content": "### Stability & Verification Report\n\nThe workspace and codebase are in a clean, stable state following the merge of `upstream/main` (`WeaverLawAgents` PR #1).\n\n---\n\n### 1. Git & Repository Status\n- **Current branch**: `main`\n- **Working tree**: Clean (`git status` reports no untracked or unstaged files).\n- **History**: All 16 commits from `upstream/main` are integrated.\n\n---\n\n### 2. Test Suite Execution\nConfigured test dependencies (`pydantic>=2.10`, `pytest>=8`) in the local user environment and ran the test suite:\n\n- **[tests/test_core.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/tests/test_core.py)** (102 tests): **102 PASSED**\n  - Event schema validation, replay deduplication, and signal contracts\n  - Quarantine routing for unmapped, conflicting, or ineligible matters\n  - State machine transitions, role enforcement, and attorney supervision boundaries\n  - Action proposal and approval digest checks, tamper rejection, and revocation enforcement\n  - Seeded malformed input fuzzing\n- **[tests/test_postgres_contract.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/tests/test_postgres_contract.py)** (12 tests): **12 PASSED**\n  - Conditional status/scope updates and stale update rollbacks\n  - Illegal mutation emission prevention and nested transaction denial\n  - Intake receive, resolve promotion/quarantine, and review gate enforcement\n- **[tests/test_postgres_live.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/tests/test_postgres_live.py)**: **1 PASSED, 41 SKIPPED**\n  - Gracefully skipped as designed because no live disposable PostgreSQL instance is provisioned in this local environment.\n\n**Total**: **114 passed, 41 skipped in 0.23s**.\n\n---\n\n### 3. File Verification\nAll core PR #1 components and governance assets are verified:\n- Core service logic: [services/correspondence/core.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/services/correspondence/core.py)\n- Postgres adapter: [services/correspondence/postgres.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/services/correspondence/postgres.py)\n- Database migrations: [database/migrations/001_correspondence_control_layer.sql](https://github.com/mountainjusticelaw-spec/new-project/blob/main/database/migrations/001_correspondence_control_layer.sql)\n- SQL test definitions: [database/tests/001_correspondence_control_layer_test.sql](https://github.com/mountainjusticelaw-spec/new-project/blob/main/database/tests/001_correspondence_control_layer_test.sql)\n- Workspace skills: `.agents/skills/wl-01` through `wl-10`\n\n---\n\n### 4. Residual Risks & Next Review Gate\n- **Live PostgreSQL Integration**: `tests/test_postgres_live.py` executes against disposable local PostgreSQL clusters with `initdb`/`pg_ctl`. In environments where PostgreSQL 16+ is available, running this suite will exercise the live RLS policies and table constraints.\n- **Next Gate**: Downstream feature branch development building on the synthetic correspondence core per [workflows/incoming-email/PR1_SPEC.md](https://github.com/mountainjusticelaw-spec/new-project/blob/main/workflows/incoming-email/PR1_SPEC.md).",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "f2502b39-b6f5-431f-8ebf-794d084c51cf",
+      "created_at": "2026-11-24T10:26:24.971Z",
+      "sender": "macOS",
+      "is_cancelled": false
     }
   ]
 }
