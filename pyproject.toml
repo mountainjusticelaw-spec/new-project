@@ -1,0 +1,11 @@
+[project]
+name = "weaverlawagents-synthetic-core"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.10,<3"]
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+postgres = ["psycopg>=3.2,<4"]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
