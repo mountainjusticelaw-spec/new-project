@@ -100,6 +100,18 @@
       "created_at": "2026-11-24T10:20:36.600Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "af72e067-1f2f-479a-9b37-7ce980be358c",
+      "role": "agent",
+      "content": "Fetched and merged the latest changes from `upstream` (`WeaverLawAgents`):\n\n1. **Fetched `upstream`**: Pulled `upstream/main` (commit `23bd718`, which includes merged PR #1: `feature/001-synthetic-correspondence-core`).\n2. **Merged into `main`**: Brought the correspondence control layer, database migrations, tests, and skills into `main`:\n   - [services/correspondence/core.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/services/correspondence/core.py)\n   - [services/correspondence/postgres.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/services/correspondence/postgres.py)\n   - [database/migrations/001_correspondence_control_layer.sql](https://github.com/mountainjusticelaw-spec/new-project/blob/main/database/migrations/001_correspondence_control_layer.sql)\n   - [database/tests/001_correspondence_control_layer_test.sql](https://github.com/mountainjusticelaw-spec/new-project/blob/main/database/tests/001_correspondence_control_layer_test.sql)\n   - [tests/test_core.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/tests/test_core.py), [tests/test_postgres_contract.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/tests/test_postgres_contract.py), [tests/test_postgres_live.py](https://github.com/mountainjusticelaw-spec/new-project/blob/main/tests/test_postgres_live.py)\n   - [workflows/incoming-email/PR1_SPEC.md](https://github.com/mountainjusticelaw-spec/new-project/blob/main/workflows/incoming-email/PR1_SPEC.md)\n   - `.agents/skills/wl-01` through `wl-10`\n3. **Branch cleanup**: `feature/001-synthetic-correspondence-core` was merged into `main` upstream and did not exist as a local branch in this workspace, so no local branch deletion was necessary.\n\nAll changes are saved and will sync automatically.",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "d70fa019-e192-4fb7-b12a-66e7cc2db0e6",
+      "created_at": "2026-11-24T10:21:56.248Z",
+      "sender": "macOS",
+      "is_cancelled": false
     }
   ]
 }
